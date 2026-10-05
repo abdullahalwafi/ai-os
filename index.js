@@ -5,6 +5,7 @@ const handleTasks = require('./src/tasks');
 const handleEvents = require('./src/events');
 const handleEventRouter = require('./src/event-router');
 const handleWorker = require('./src/worker-executor');
+const handleHermesRuntime = require('./src/hermes-runtime');
 
 const PORT = Number(process.env.PORT || 3100);
 if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
@@ -31,6 +32,7 @@ async function checkDatabase() {
 
 const server = http.createServer(async (req, res) => {
   const pathname = req.url.split('?')[0];
+  if (await handleHermesRuntime(req, res, sendJson, logError)) return;
   if (req.method === 'GET' && pathname === '/health') {
     let available = true;
     try {
