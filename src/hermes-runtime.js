@@ -140,7 +140,7 @@ async function handleChat(db, body, generate = generateChat) {
     if (totalLength > 24000) {
       const error = new Error('invalid_chat_history'); error.httpStatus = 400; throw error;
     }
-    const result = await generate({ system: buildRolePrompt(agent), messages: boundedMessages });
+    const result = await generate({ system: buildRolePrompt(agent), messages: boundedMessages, maxTokens: 2048 });
     output = result.output;
   }
   return {
