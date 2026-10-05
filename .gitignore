@@ -1,0 +1,8 @@
+.env
+.env.*
+node_modules/
+.agents/
+.codex/
+*.log
+*.pem
+*.key
