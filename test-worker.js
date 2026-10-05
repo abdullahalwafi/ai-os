@@ -23,12 +23,16 @@ async function verify(key, from) {
   assert(task.completed_at >= task.started_at);
   const expected = { analysis_version: 1, keyword: 'jasa oem speaker custom', previous_rank: 9, current_rank: 21,
     rank_change: -12, severity: 'high', recommendation: 'manual_review_required' };
-  assert.deepEqual(task.result_json, expected);
+  for (const key of ['keyword', 'previous_rank', 'current_rank', 'rank_change', 'severity']) {
+    assert.equal(task.result_json[key], expected[key]);
+  }
+  assert([1, 2].includes(task.result_json.analysis_version));
+  assert.equal(task.result_json.llm_status, task.result_json.analysis_version === 2 ? 'success' : 'fallback');
   const [logs] = await pool.execute("SELECT context_json FROM activity_logs WHERE task_id=? AND action='task.status_changed' ORDER BY id", [task.id]);
   const contexts = logs.map(l => l.context_json);
   assert.deepEqual(contexts, [...(from === 'queued' ? [{ from: 'created', to: 'queued' }] : []),
     { from, to: 'running' }, { from: 'running', to: 'completed' }]);
-  return expected;
+  return task.result_json;
 }
 (async () => {
   try {
