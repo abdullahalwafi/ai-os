@@ -11,7 +11,7 @@ function getConfig() {
   return { provider, model };
 }
 
-async function complete({ system, prompt, temperature, maxTokens, json }) {
+async function complete({ system, prompt, messages, temperature, maxTokens, json }) {
   const config = getConfig();
   const signal = AbortSignal.timeout(45000);
   try {
@@ -19,7 +19,7 @@ async function complete({ system, prompt, temperature, maxTokens, json }) {
       method: 'POST', redirect: 'error', signal,
       headers: { Authorization: 'Bearer ' + process.env.GROQ_API_KEY, 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: config.model,
-        messages: [...(system ? [{ role: 'system', content: system }] : []), { role: 'user', content: prompt }],
+        messages: messages || [...(system ? [{ role: 'system', content: system }] : []), { role: 'user', content: prompt }],
         temperature, max_completion_tokens: maxTokens,
         ...(json ? { response_format: { type: 'json_object' } } : {}),
       }),

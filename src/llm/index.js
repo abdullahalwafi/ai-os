@@ -22,4 +22,26 @@ async function generate(options = {}, json = false) {
 module.exports = {
   generateText: options => generate(options, false),
   generateJSON: options => generate(options, true),
+  generateChat: async options => {
+    const { system = '', messages, temperature = 0.2, maxTokens = 1024 } = options || {};
+    if (typeof system !== 'string' || system.length > 16000 || !Array.isArray(messages) ||
+        messages.length < 1 || messages.length > 12 || !Number.isFinite(temperature) ||
+        temperature < 0 || temperature > 2 || !Number.isInteger(maxTokens) ||
+        maxTokens < 1 || maxTokens > 4096) {
+      throw new LLMError('llm_invalid_input');
+    }
+    const normalized = messages.map(message => {
+      if (!message || !['user', 'assistant'].includes(message.role) ||
+          typeof message.content !== 'string' || !message.content.trim() ||
+          message.content.length > 8000) throw new LLMError('llm_invalid_input');
+      return { role: message.role, content: message.content.trim() };
+    });
+    const totalLength = normalized.reduce((sum, message) => sum + message.content.length, 0);
+    if (totalLength > 24000) throw new LLMError('llm_invalid_input');
+    const result = await complete({
+      messages: [...(system ? [{ role: 'system', content: system }] : []), ...normalized],
+      temperature, maxTokens, json: false,
+    });
+    return result;
+  },
 };
