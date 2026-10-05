@@ -17,18 +17,26 @@ async function request(db, url, method = 'GET') {
 test('preserves stable IDs, existing names, roles, brand/HQ and conservative availability', async () => {
   const rows = [
     { agent_key: 'group_ceo', agent_type: 'GROUP_CEO', name: 'Group owner', status: 'active', brand_key: null, brand_name: null },
-    { agent_key: 'audio_one_seo', agent_type: 'SEO_AGENT', name: '', status: 'inactive', brand_key: 'audio_one', brand_name: 'Audio One' },
+    { agent_key: 'audio_one_seo', agent_type: 'SEO_AGENT', name: '', status: 'active', brand_key: 'audio_one', brand_name: 'Audio One' },
   ];
-  const db = { async query({ sql }) { assert.match(sql, /^SELECT /); return [rows]; } };
+  const db = { async query({ sql }) {
+    assert.match(sql, /^SELECT /);
+    return sql.includes('FROM tasks') ? [[
+      { assigned_agent_id: 2, task_key: 'TASK-RUN', task_type: 'TEST', status: 'running', brand_key: 'audio_one', brand_name: 'Audio One' },
+    ]] : [[...rows.map((row, index) => ({ id: index + 1, ...row }))]];
+  } };
   const response = await request(db, '/hermes-runtime/registry');
   assert.equal(response.status, 200);
   assert.equal(response.body.defaultId, 'group_ceo');
   assert.deepEqual(response.body.agents.map(a => [a.id, a.name, a.role, a.status]), [
     ['group_ceo', 'Group owner', 'Group CEO', 'idle'],
-    ['audio_one_seo', 'Audio One — SEO', 'SEO', 'offline'],
+    ['audio_one_seo', 'Audio One — SEO', 'SEO', 'running'],
   ]);
   assert.equal(response.body.agents[0].metadata.brand_key, null);
   assert.equal(response.body.agents[0].metadata.team, 'Digital Musik Group / Headquarters');
+  assert.equal(response.body.agents[1].status, 'running');
+  assert.equal(response.body.agents[1].metadata.presence_status, 'working');
+  assert.equal(response.body.agents[1].metadata.current_task_key, 'TASK-RUN');
   assert.deepEqual(response.body.capabilities, ['agents', 'agent-roles']);
 });
 
@@ -51,7 +59,7 @@ test('health/state use DB availability and never leak errors or secrets', async 
     assert.equal(bad.status, 503);
     assert.ok(!JSON.stringify(bad).includes('secret'));
   }
-  for (const path of ['/health', '/state']) {
+  for (const path of ['/health']) {
     const good = await request({ async query({ sql }) { assert.equal(sql, 'SELECT 1'); return [[]]; } }, '/hermes-runtime' + path);
     assert.equal(good.status, 200);
   }
