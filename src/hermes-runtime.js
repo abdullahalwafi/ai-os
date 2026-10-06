@@ -227,6 +227,22 @@ function delegationRoleName(agentType) {
   return ROLES[agentType] || agentType;
 }
 
+function resolveBrand(text, agents) {
+  const lower = text.toLocaleLowerCase('id-ID'); const brands = new Map();
+  for (const agent of agents) if (agent.metadata.brand_key) brands.set(agent.metadata.brand_key, agent.metadata);
+  const hits = [];
+  for (const [brand_key, brand] of brands) {
+    const aliases = [brand.brand_name, brand.brand_domain,
+      ...(brand_key === 'digital_musik' ? ['digitalmusik'] : []),
+      ...(brand_key === 'audio_one' ? ['audioone'] : []),
+      ...(brand_key === 'gg_audio' ? ['ggaudio'] : []),
+      ...(brand_key === 'paudio' ? ['p audio', 'paudio'] : [])];
+    if (aliases.filter(alias => typeof alias === 'string').some(alias => lower.includes(alias.toLocaleLowerCase('id-ID')))) hits.push({ brand_key, ...brand });
+  }
+  const unique = [...new Map(hits.map(hit => [hit.brand_key, hit])).values()];
+  return unique.length === 1 ? { brand: unique[0] } : unique.length > 1 ? { conflict: true } : null;
+}
+
 function commandKey(body, agentKey, messages) {
   const supplied = typeof body.idempotency_key === 'string' ? body.idempotency_key.trim() : '';
   const session = typeof body.session_id === 'string' ? body.session_id.trim() :
@@ -336,35 +352,47 @@ async function handleChat(db, body, generate = generateChat, create = createTask
   const command = parseSeoCommand(latestUser);
   const webCommand = parseWebQcCommand(latestUser);
   const execution = parseExecutionIntent(latestUser);
-  const delegation = agent.metadata.agent_type === 'BRAND_CEO' ? parseCeoDelegation(latestUser, agents) : null;
-  if (delegation) {
+  const brandResolution = agent.metadata.agent_type === 'BRAND_CEO' ? resolveBrand(latestUser, agents) : null;
+  const targetCeo = brandResolution?.brand && brandResolution.brand.brand_key !== agent.metadata.brand_key
+    ? agents.find(candidate => candidate.metadata.agent_type === 'BRAND_CEO' && candidate.metadata.brand_key === brandResolution.brand.brand_key) : agent;
+  const routed = Boolean(targetCeo && targetCeo.id !== agent.id);
+  const delegation = agent.metadata.agent_type === 'BRAND_CEO'
+    ? (parseCeoDelegation(latestUser, agents) || (webCommand ? { targetRole: 'WEB_QC_AGENT' } : null)) : null;
+  if (brandResolution?.conflict) {
+    output = 'Permintaan menyebut lebih dari satu brand/domain terdaftar. Mohon tentukan target yang benar.';
+  } else if (delegation) {
+    const delegatingCeo = targetCeo;
+    if (!delegatingCeo || delegatingCeo.metadata.agent_type !== 'BRAND_CEO') {
+      output = 'Delegasi dihentikan: Brand CEO target tidak ditemukan.';
+    } else {
     if (delegation.denied) {
       output = delegation.denied;
     } else {
-      const resolution = resolveDelegationWorker(agent, delegation, agents);
+      const resolution = resolveDelegationWorker(delegatingCeo, delegation, agents);
       if (resolution.denied) {
         output = resolution.denied;
       } else if (!['SEO_AGENT', 'WEB_QC_AGENT'].includes(delegation.targetRole)) {
-        output = `Permintaan ini cocok untuk ${resolution.worker.name} — ${delegationRoleName(delegation.targetRole)} ${agent.metadata.brand_name}. Capability ${delegationRoleName(delegation.targetRole)} execution belum diaktifkan, jadi belum ada task yang dibuat.`;
+        output = `${routed ? `Permintaan diteruskan ke ${delegatingCeo.name} — CEO ${delegatingCeo.metadata.brand_name}.\n` : ''}Permintaan ini cocok untuk ${resolution.worker.name} — ${delegationRoleName(delegation.targetRole)} ${delegatingCeo.metadata.brand_name}. Capability ${delegationRoleName(delegation.targetRole)} execution belum diaktifkan, jadi belum ada task yang dibuat.`;
       } else if (delegation.targetRole === 'SEO_AGENT') {
         const { task, duplicate } = await createGatedTask(commandKey(body, agent.id, messages), {
-          brand_key: agent.metadata.brand_key,
+          brand_key: delegatingCeo.metadata.brand_key,
           agent_key: resolution.worker.id,
           task_type: 'SEO_ANALYSIS',
           title: `SEO Analysis: ${delegation.keyword}`,
-          description: `CEO-delegated keyword analysis for ${agent.metadata.brand_name}.`,
+          description: `CEO-delegated keyword analysis for ${delegatingCeo.metadata.brand_name}.`,
           priority: 'P3',
-          payload: { keyword: delegation.keyword, source: 'hermes_ceo_delegation', delegated_by: agent.id },
-        }, create, { delegated_by_agent_id: agent.metadata.agent_id, delegated_by_agent_key: agent.id });
-        output = `${duplicate ? 'Task sudah tersedia.' : `Saya delegasikan ke ${resolution.worker.name} — SEO ${agent.metadata.brand_name}.`}\nTask:\n${task.task_key}\nType:\nSEO_ANALYSIS\nStatus:\n${task.status}\nTask belum dijalankan.`;
+          payload: { keyword: delegation.keyword, source: 'hermes_ceo_delegation', delegated_by: delegatingCeo.id, ...(routed ? { origin_agent_key: agent.id } : {}) },
+        }, create, { delegated_by_agent_id: delegatingCeo.metadata.agent_id, delegated_by_agent_key: delegatingCeo.id, ...(routed ? { origin_agent_key: agent.id, rerouted: true } : {}) });
+        output = `${routed ? `Permintaan ini ditujukan ke ${delegatingCeo.metadata.brand_name}. Saya teruskan ke ${delegatingCeo.name} — CEO ${delegatingCeo.metadata.brand_name}.\n` : ''}${duplicate ? 'Task sudah tersedia.' : `Saya delegasikan ke ${resolution.worker.name} — SEO ${delegatingCeo.metadata.brand_name}.`}\nTask:\n${task.task_key}\nType:\nSEO_ANALYSIS\nStatus:\n${task.status}\nTask belum dijalankan.`;
       } else {
         const { task, duplicate } = await createGatedTask(commandKey(body, agent.id, messages), {
-          brand_key: agent.metadata.brand_key, agent_key: resolution.worker.id, task_type: 'WEB_QC_CHECK',
-          title: `Web QC Check: ${agent.metadata.brand_name}`, description: `CEO-delegated read-only website check for ${agent.metadata.brand_name}.`, priority: 'P3',
-          payload: { source: 'hermes_ceo_delegation', delegated_by: agent.id },
-        }, create, { delegated_by_agent_id: agent.metadata.agent_id, delegated_by_agent_key: agent.id });
-        output = `${duplicate ? 'Task sudah tersedia.' : `Saya delegasikan ke ${resolution.worker.name} — Web QC ${agent.metadata.brand_name}.`}\nTask:\n${task.task_key}\nType:\nWEB_QC_CHECK\nStatus:\n${task.status}\nTask belum dijalankan.`;
+          brand_key: delegatingCeo.metadata.brand_key, agent_key: resolution.worker.id, task_type: 'WEB_QC_CHECK',
+          title: `Web QC Check: ${delegatingCeo.metadata.brand_name}`, description: `CEO-delegated read-only website check for ${delegatingCeo.metadata.brand_name}.`, priority: 'P3',
+          payload: { source: 'hermes_ceo_delegation', delegated_by: delegatingCeo.id, ...(routed ? { origin_agent_key: agent.id } : {}) },
+        }, create, { delegated_by_agent_id: delegatingCeo.metadata.agent_id, delegated_by_agent_key: delegatingCeo.id, ...(routed ? { origin_agent_key: agent.id, rerouted: true } : {}) });
+        output = `${routed ? `Permintaan ini ditujukan ke ${delegatingCeo.metadata.brand_name}. Saya teruskan ke ${delegatingCeo.name} — CEO ${delegatingCeo.metadata.brand_name}.\n` : ''}${duplicate ? 'Task sudah tersedia.' : `Saya delegasikan ke ${resolution.worker.name} — Web QC ${delegatingCeo.metadata.brand_name}.`}\nTask:\n${task.task_key}\nType:\nWEB_QC_CHECK\nStatus:\n${task.status}\nTask belum dijalankan.`;
       }
+    }
     }
   } else if (command?.invalid || webCommand?.invalid) {
     output = 'Perintah tidak lolos validasi safe command gate. Tidak ada task yang dibuat.';
