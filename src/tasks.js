@@ -108,3 +108,6 @@ module.exports = async function handleTasks(req, res, sendJson, logError) {
   }
   return true;
 };
+// Hermes safe command gate reuses the same validated transaction path without
+// exposing a new public route or bypassing audit/brand/agent checks.
+module.exports.createTask = create;
