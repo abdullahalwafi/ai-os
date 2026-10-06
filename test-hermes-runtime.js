@@ -132,7 +132,10 @@ test('safe SEO command creates one validated task and never executes it', async 
   assert.equal(created[0].task_type, 'SEO_ANALYSIS');
   assert.equal(created[0].agent_key, 'digital_musik_seo');
   assert.equal(created[0].brand_key, 'digital_musik');
-  assert.equal(created[0].payload.keyword, 'jasa produksi speaker custom');
+  assert.deepEqual(created[0].payload, {
+    keyword: 'jasa produksi speaker custom',
+    source: 'hermes_chat',
+  });
 });
 
 test('chat write gate rejects reverse-proxied requests before DB or task access', async () => {

@@ -6,21 +6,37 @@ function analyzeSeo(payload) {
   if (!payload || typeof payload.keyword !== 'string' || !payload.keyword.trim()) {
     fail(422, 'invalid_task_payload');
   }
-  let previous_rank = payload.previous_rank;
-  let current_rank = payload.current_rank;
-  const hasPrevious = Number.isSafeInteger(previous_rank) && previous_rank >= 1;
-  const hasCurrent = Number.isSafeInteger(current_rank) && current_rank >= 1;
-  if (!hasPrevious && !hasCurrent && (payload.source === 'hermes_chat' || (!('previous_rank' in payload) && !('current_rank' in payload)))) {
-    previous_rank = 7;
-    current_rank = 19;
-  } else if (!hasPrevious || !hasCurrent) {
+  const hasPrevious = Number.isSafeInteger(payload.previous_rank) && payload.previous_rank >= 1;
+  const hasCurrent = Number.isSafeInteger(payload.current_rank) && payload.current_rank >= 1;
+
+  if (hasPrevious && hasCurrent) {
+    const drop = payload.current_rank - payload.previous_rank;
+    return {
+      analysis_version: 1,
+      keyword: payload.keyword,
+      previous_rank: payload.previous_rank,
+      current_rank: payload.current_rank,
+      rank_change: -drop,
+      severity: drop <= 0 ? 'none' : drop <= 3 ? 'low' : drop <= 10 ? 'medium' : 'high',
+      recommendation: 'manual_review_required',
+    };
+  }
+
+  // Reject incomplete rank telemetry (e.g. one provided but invalid/missing)
+  if ((payload.previous_rank !== undefined || payload.current_rank !== undefined) && (!hasPrevious || !hasCurrent)) {
     fail(422, 'invalid_task_payload');
   }
-  const drop = current_rank - previous_rank;
-  return { analysis_version: 1, keyword: payload.keyword,
-    previous_rank, current_rank,
-    rank_change: -drop, severity: drop <= 0 ? 'none' : drop <= 3 ? 'low' : drop <= 10 ? 'medium' : 'high',
-    recommendation: 'manual_review_required' };
+
+  // Pure keyword advisory mode: never fabricate rank, rank_change, or severity
+  return {
+    analysis_version: 1,
+    keyword: payload.keyword,
+    previous_rank: null,
+    current_rank: null,
+    rank_change: null,
+    severity: 'unknown',
+    recommendation: 'advisory_keyword_analysis',
+  };
 }
 
 async function logTransition(conn, task, from, to) {

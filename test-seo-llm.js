@@ -39,6 +39,40 @@ async function verify(key, version) {
     for (const code of ['llm_timeout', 'llm_rate_limited', 'llm_invalid_response', 'llm_provider_error']) {
       assert.equal((await analyze(facts, {}, async () => { throw new Error(code); })).analysis_version, 1);
     }
+    const advisoryFacts = analyzeSeo({ keyword: 'sound system jakarta', source: 'hermes_chat' });
+    assert.deepEqual(advisoryFacts, {
+      analysis_version: 1,
+      keyword: 'sound system jakarta',
+      previous_rank: null,
+      current_rank: null,
+      rank_change: null,
+      severity: 'unknown',
+      recommendation: 'advisory_keyword_analysis',
+    });
+    const advisoryOutput = {
+      ...advisoryFacts,
+      analysis_version: 2,
+      summary: 'Belum ada data posisi ranking yang diberikan untuk keyword ini. Analisis berikut bersifat advisory dan bukan diagnosis penurunan ranking.',
+      possible_causes: ['Hypothesis (needs verification): intent pencarian perlu dipetakan terhadap halaman yang tersedia.'],
+      recommended_actions: [{ action: 'Petakan intent keyword dan periksa cakupan halaman terkait.', priority: 'P1' }],
+      content_opportunity: { recommended: true, reason: 'Usulan konten perlu divalidasi terhadap halaman dan permintaan aktual.' },
+      confidence: 0.3,
+    };
+    let advisoryRequest;
+    const advisory = await analyze(advisoryFacts, {}, async request => {
+      advisoryRequest = request;
+      return { output: advisoryOutput, provider: 'test', model: 'test-model' };
+    });
+    assert.equal(advisory.llm_status, 'success');
+    for (const field of ['previous_rank', 'current_rank', 'rank_change']) assert.equal(advisory[field], null);
+    assert.equal(advisory.severity, 'unknown');
+    assert.match(advisory.summary, /bukan diagnosis penurunan ranking/i);
+    assert.match(advisoryRequest.system, /Do NOT infer or invent ranking positions/i);
+    assert.match(advisoryRequest.system, /Search Console data/i);
+    assert.equal(JSON.parse(advisoryRequest.prompt).context.mode, 'keyword_advisory');
+    assert.equal((await analyze(advisoryFacts, {}, async () => ({ output: {
+      ...advisoryOutput, previous_rank: 7, current_rank: 19, rank_change: -12, severity: 'high',
+    } }))).llm_status, 'fallback');
     for (const token of [null, 'wrong']) assert.equal((await call('/tasks/missing/execute', undefined, token)).status, 401);
     const key = await routed();
     const attempts = await Promise.all([1, 2].map(() => call('/tasks/' + key + '/execute')));

@@ -117,6 +117,11 @@ function formatExecutionSummary(agentName, taskKey, status, result) {
     `${result.severity || 'unknown'}`,
   ];
 
+  if (result.previous_rank != null && result.current_rank != null) {
+    const change = result.rank_change > 0 ? `+${result.rank_change}` : `${result.rank_change}`;
+    lines.push('', 'Ranking:', `${result.previous_rank} → ${result.current_rank} (${change})`);
+  }
+
   if (result.summary) {
     lines.push('', 'Summary:', `${result.summary}`);
   } else if (result.recommendation) {
@@ -271,7 +276,7 @@ async function handleChat(db, body, generate = generateChat, create = createTask
         title: `SEO Analysis: ${command.keyword}`,
         description: `Analyze keyword for ${agent.metadata.brand_name}.`,
         priority: 'P3',
-        payload: { keyword: command.keyword, source: 'hermes_chat', previous_rank: 7, current_rank: 19 },
+        payload: { keyword: command.keyword, source: 'hermes_chat' },
       }, create);
       output = `${duplicate ? 'Task sudah tersedia.' : 'Task dibuat.'}\n${task.task_key}\nSEO Analysis\nAgent: ${agent.name}\nStatus: ${task.status}`;
     }
