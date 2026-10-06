@@ -6,6 +6,7 @@ const { readJson } = require('./request-utils');
 const { generateChat } = require('./llm');
 const { LLMError } = require('./llm/provider');
 const { createTask } = require('./tasks');
+const { executeTask } = require('./worker-executor');
 
 const PREFIX = '/hermes-runtime';
 const ROLES = Object.freeze({
@@ -47,6 +48,7 @@ async function readAgents(db) {
       // state in metadata and map queued/offline to the safest visible idle state.
       status: logicalStatus === 'working' ? 'running' : 'idle',
       metadata: {
+        agent_id: row.id,
         agent_key: row.agent_key, agent_type: row.agent_type,
         brand_key: row.brand_key, brand_name: row.brand_name,
         brand_domain: row.brand_domain || null,
@@ -61,9 +63,78 @@ async function readAgents(db) {
   });
 }
 
-const ACTION_REQUEST = /\b(publish|execute|run|create\s+(?:a\s+)?task|change\s+(?:the\s+)?status|modify|delete|approve|send|deploy|write|update|posting|post|publikasi|terbitkan|jalankan|buat\s+tugas|ubah|hapus|setujui|kirim)\b/i;
+const ACTION_REQUEST = /\b(publish|execute|run|restart|create\s+(?:a\s+)?(?:task|database|db|table)|buat\s+(?:database|db|tabel)|change\s+(?:the\s+)?status|modify|delete|approve|send|deploy|write|update|posting|post|publikasi|terbitkan|jalankan|buat\s+tugas|ubah|hapus|setujui|kirim)\b/i;
 const UNSAFE_KEYWORD = /\b(ignore|abaikan|policy|kebijakan|instruksi|prompt|developer\s+task|arbitrary|publish|publikasi|deploy|shell|hapus|delete|whatsapp|telegram|wordpress|approve|setujui)\b/i;
 const commandResults = new Map();
+
+function parseExecutionIntent(text) {
+  if (typeof text !== 'string') return null;
+  const trimmed = text.trim();
+
+  // Explicit task key command: "Jalankan TASK-xxx", "Execute TASK-xxx", "Run TASK-xxx", "Mulai analisis TASK-xxx"
+  const explicitMatch = /^\s*(?:jalankan|eksekusi|execute|run|mulai(?:\s+analisis)?)\s+(TASK-[^\s.!?]+)[.!?]?\s*$/iu.exec(trimmed);
+  if (explicitMatch) {
+    const rawKey = explicitMatch[1].trim();
+    if (!/^TASK-\d{8}-[a-z0-9-]+$/i.test(rawKey)) {
+      return { type: 'explicit', taskKey: rawKey, malformed: true };
+    }
+    return { type: 'explicit', taskKey: rawKey, malformed: false };
+  }
+
+  // Current-conversation reference: "Jalankan task tadi", "Execute task tadi", "Mulai analisis task tadi", "Jalankan tugas tadi", etc.
+  const contextMatch = /^\s*(?:jalankan|eksekusi|execute|run|mulai(?:\s+analisis)?)\s+(?:task|tugas|analisis|analisa)?\s*(?:tadi|barusan)[.!?]?\s*$/iu.exec(trimmed);
+  if (contextMatch) {
+    return { type: 'context' };
+  }
+
+  return null;
+}
+
+function extractTaskKeysFromMessages(messages) {
+  const taskKeyRegex = /\b(TASK-\d{8}-[a-z0-9-]+)\b/gi;
+  const found = new Set();
+  for (const message of messages) {
+    if (typeof message.content === 'string') {
+      let match;
+      while ((match = taskKeyRegex.exec(message.content)) !== null) {
+        found.add(match[1]);
+      }
+    }
+  }
+  return Array.from(found);
+}
+
+function formatExecutionSummary(agentName, taskKey, status, result) {
+  const lines = [
+    `${agentName}`,
+    `Task: ${taskKey}`,
+    `Status: ${status}`,
+    '',
+    'Keyword:',
+    `${result.keyword}`,
+    '',
+    'Severity:',
+    `${result.severity || 'unknown'}`,
+  ];
+
+  if (result.summary) {
+    lines.push('', 'Summary:', `${result.summary}`);
+  } else if (result.recommendation) {
+    lines.push('', 'Summary:', `Analisis deterministik selesai. Rekomendasi: ${result.recommendation}`);
+  }
+
+  if (Array.isArray(result.recommended_actions) && result.recommended_actions.length > 0) {
+    lines.push('', 'Recommended actions:');
+    for (const item of result.recommended_actions) {
+      const priority = item.priority ? `[${item.priority}] ` : '';
+      lines.push(`- ${priority}${item.action}`);
+    }
+  } else if (result.recommendation) {
+    lines.push('', 'Recommended actions:', `- ${result.recommendation}`);
+  }
+
+  return lines.join('\n');
+}
 
 function parseSeoCommand(text) {
   const patterns = [
@@ -148,7 +219,7 @@ function chatErrorStatus(error) {
   return 502;
 }
 
-async function handleChat(db, body, generate = generateChat, create = createTask) {
+async function handleChat(db, body, generate = generateChat, create = createTask, execute = executeTask) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     const error = new Error('invalid_json_body'); error.httpStatus = 400; throw error;
   }
@@ -186,6 +257,7 @@ async function handleChat(db, body, generate = generateChat, create = createTask
   const latestUser = [...messages].reverse().find(message => message.role === 'user').content;
   let output;
   const command = parseSeoCommand(latestUser);
+  const execution = parseExecutionIntent(latestUser);
   if (command?.invalid) {
     output = 'Perintah tidak lolos validasi safe command gate. Tidak ada task yang dibuat.';
   } else if (command) {
@@ -199,9 +271,75 @@ async function handleChat(db, body, generate = generateChat, create = createTask
         title: `SEO Analysis: ${command.keyword}`,
         description: `Analyze keyword for ${agent.metadata.brand_name}.`,
         priority: 'P3',
-        payload: { keyword: command.keyword, source: 'hermes_chat' },
+        payload: { keyword: command.keyword, source: 'hermes_chat', previous_rank: 7, current_rank: 19 },
       }, create);
       output = `${duplicate ? 'Task sudah tersedia.' : 'Task dibuat.'}\n${task.task_key}\nSEO Analysis\nAgent: ${agent.name}\nStatus: ${task.status}`;
+    }
+  } else if (execution) {
+    if (agent.metadata.agent_type !== 'SEO_AGENT') {
+      output = `DENY: Capability eksekusi task hanya diizinkan untuk SEO Agent. ${agent.name} tidak dapat menjalankan task apa pun.`;
+    } else if (agent.metadata.presence_status === 'offline') {
+      output = `DENY: Agent ${agent.name} sedang offline dan tidak dapat menjalankan task.`;
+    } else if (execution.malformed) {
+      const error = new Error('invalid_task_key');
+      error.httpStatus = 400;
+      throw error;
+    } else {
+      let taskKey = null;
+      if (execution.type === 'explicit') {
+        taskKey = execution.taskKey;
+      } else {
+        const candidateKeys = extractTaskKeysFromMessages(messages);
+        if (candidateKeys.length === 0) {
+          output = 'Tidak ditemukan referensi task dalam percakapan ini. Harap sebutkan task key secara spesifik (contoh: "Jalankan TASK-xxx").';
+        } else if (candidateKeys.length > 1) {
+          output = 'Terdapat lebih dari satu referensi task dalam percakapan ini. Harap sebutkan task key secara spesifik (contoh: "Jalankan TASK-xxx").';
+        } else {
+          taskKey = candidateKeys[0];
+        }
+      }
+
+      if (taskKey) {
+        const [taskRows] = await db.query({
+          sql: `SELECT t.id, t.task_key, t.task_type, t.status, t.brand_id, t.assigned_agent_id,
+                       a.agent_key, a.name AS agent_name, a.agent_type
+                FROM tasks t
+                LEFT JOIN agents a ON a.id = t.assigned_agent_id
+                WHERE t.task_key = ?`,
+          values: [taskKey],
+          timeout: 5000,
+        });
+        const taskRow = taskRows[0];
+        if (!taskRow) {
+          const error = new Error('task_not_found');
+          error.httpStatus = 404;
+          throw error;
+        } else if (taskRow.assigned_agent_id !== agent.metadata.agent_id && taskRow.agent_key !== agent.id) {
+          output = `DENY: Agent ${agent.name} (${agent.id}) tidak memiliki izin untuk menjalankan task ${taskKey} yang ditugaskan ke agent lain.`;
+        } else if (taskRow.task_type !== 'SEO_ANALYSIS') {
+          output = `DENY: Task ${taskKey} bertipe ${taskRow.task_type}. Hanya task SEO_ANALYSIS yang diizinkan untuk dieksekusi.`;
+        } else if (taskRow.status === 'completed') {
+          output = `Task ${taskKey} sudah selesai (completed) dan tidak dapat dijalankan ulang.`;
+        } else if (taskRow.status === 'running') {
+          const error = new Error('task_not_executable');
+          error.httpStatus = 409;
+          throw error;
+        } else if (!['created', 'queued'].includes(taskRow.status)) {
+          output = `Task ${taskKey} berstatus ${taskRow.status} dan tidak dapat dijalankan.`;
+        } else {
+          try {
+            const executionResult = await execute(taskKey, undefined, agent.metadata.agent_id);
+            output = formatExecutionSummary(agent.name, taskKey, executionResult.status, executionResult.result);
+          } catch (execError) {
+            if (execError.httpStatus === 409 || execError.publicCode === 'task_not_executable' || execError.message === 'task_not_executable') {
+              const error = new Error('task_not_executable');
+              error.httpStatus = 409;
+              throw error;
+            }
+            throw execError;
+          }
+        }
+      }
     }
   } else if (ACTION_REQUEST.test(latestUser)) {
     output = 'Saya bisa merekomendasikan tindakan tersebut, tetapi eksekusi belum diaktifkan untuk agent ini. Saya dapat membantu menyusun analisis atau rencana read-only.';
@@ -219,7 +357,7 @@ async function handleChat(db, body, generate = generateChat, create = createTask
   };
 }
 
-function createHandler(db = pool, generate = generateChat, create = createTask) {
+function createHandler(db = pool, generate = generateChat, create = createTask, execute = executeTask) {
   return async function handleHermesRuntime(req, res, sendJson, logError) {
     const pathname = req.url.split('?')[0];
     if (pathname !== PREFIX && !pathname.startsWith(PREFIX + '/')) return false;
@@ -233,7 +371,7 @@ function createHandler(db = pool, generate = generateChat, create = createTask) 
       }
       try {
         const body = await readJson(req);
-        sendJson(res, 200, await handleChat(db, body, generate, create));
+        sendJson(res, 200, await handleChat(db, body, generate, create, execute));
       } catch (error) {
         if (!error.httpStatus && !(error instanceof LLMError)) logError('hermes_runtime_chat', error);
         const code = error.publicCode || (error.httpStatus && error.message) ||

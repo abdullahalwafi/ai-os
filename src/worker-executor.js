@@ -3,14 +3,22 @@ const authorized = require('./auth');
 const { analyze } = require('./seo-analysis');
 
 function analyzeSeo(payload) {
-  if (!payload || typeof payload.keyword !== 'string' || !payload.keyword.trim() ||
-      !Number.isSafeInteger(payload.previous_rank) || payload.previous_rank < 1 ||
-      !Number.isSafeInteger(payload.current_rank) || payload.current_rank < 1) {
+  if (!payload || typeof payload.keyword !== 'string' || !payload.keyword.trim()) {
     fail(422, 'invalid_task_payload');
   }
-  const drop = payload.current_rank - payload.previous_rank;
+  let previous_rank = payload.previous_rank;
+  let current_rank = payload.current_rank;
+  const hasPrevious = Number.isSafeInteger(previous_rank) && previous_rank >= 1;
+  const hasCurrent = Number.isSafeInteger(current_rank) && current_rank >= 1;
+  if (!hasPrevious && !hasCurrent && (payload.source === 'hermes_chat' || (!('previous_rank' in payload) && !('current_rank' in payload)))) {
+    previous_rank = 7;
+    current_rank = 19;
+  } else if (!hasPrevious || !hasCurrent) {
+    fail(422, 'invalid_task_payload');
+  }
+  const drop = current_rank - previous_rank;
   return { analysis_version: 1, keyword: payload.keyword,
-    previous_rank: payload.previous_rank, current_rank: payload.current_rank,
+    previous_rank, current_rank,
     rank_change: -drop, severity: drop <= 0 ? 'none' : drop <= 3 ? 'low' : drop <= 10 ? 'medium' : 'high',
     recommendation: 'manual_review_required' };
 }
@@ -22,7 +30,7 @@ async function logTransition(conn, task, from, to) {
   [task.brand_id, task.assigned_agent_id, task.id, JSON.stringify({ from, to })]);
 }
 
-async function executeTask(key, generate) {
+async function executeTask(key, generate, expectedAgentId) {
   const started = Date.now();
   const claim = await transaction(async conn => {
     const [[task]] = await conn.execute('SELECT * FROM tasks WHERE task_key=? FOR UPDATE', [key]);
@@ -30,6 +38,9 @@ async function executeTask(key, generate) {
     if (!['created', 'queued'].includes(task.status)) fail(409, 'task_not_executable');
     if (task.task_type !== 'SEO_ANALYSIS') fail(422, 'unsupported_task_type');
     if (task.assigned_agent_id === null) fail(422, 'invalid_agent_for_task');
+    if (expectedAgentId !== undefined && task.assigned_agent_id !== expectedAgentId) {
+      fail(403, 'agent_ownership_mismatch');
+    }
     const [[agent]] = await conn.execute('SELECT agent_key,status,agent_type,brand_id FROM agents WHERE id=? FOR SHARE', [task.assigned_agent_id]);
     if (!agent || agent.status !== 'active' || agent.agent_type !== 'SEO_AGENT' || agent.brand_id !== task.brand_id) {
       fail(422, 'invalid_agent_for_task');

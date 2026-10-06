@@ -6,14 +6,14 @@ const { createHandler } = require('./src/hermes-runtime');
 const pool = require('./src/db/mysql');
 test.after(() => pool.end());
 
-async function request(db, url, method = 'GET', body, generate, create) {
+async function request(db, url, method = 'GET', body, generate, create, execute) {
   let result;
   const headers = {};
   const connection = { url, method, headers: {}, socket: { remoteAddress: '127.0.0.1' } };
   const req = body === undefined ? Object.assign(Readable.from([]), connection) :
     Object.assign(Readable.from([Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))]), connection);
   const res = { setHeader(key, value) { headers[key] = value; } };
-  const handled = await createHandler(db, generate, create)(req, res, (res, status, body) => { result = { status, body, headers }; }, () => {});
+  const handled = await createHandler(db, generate, create, execute)(req, res, (res, status, body) => { result = { status, body, headers }; }, () => {});
   return { handled, ...result };
 }
 
@@ -183,4 +183,225 @@ test('health/state use DB availability and never leak errors or secrets', async 
     const good = await request({ async query({ sql }) { assert.equal(sql, 'SELECT 1'); return [[]]; } }, '/hermes-runtime' + path);
     assert.equal(good.status, 200);
   }
+});
+
+test('TASK 020: explicit execution executes safe SEO task and returns formatted summary', async () => {
+  const agentRows = [
+    { id: 1, agent_key: 'digital_musik_seo', agent_type: 'SEO_AGENT', name: 'Raka', status: 'active', brand_key: 'digital_musik', brand_name: 'Digital Musik' },
+    { id: 2, agent_key: 'audio_one_seo', agent_type: 'SEO_AGENT', name: 'Reno', status: 'active', brand_key: 'audio_one', brand_name: 'Audio One' },
+  ];
+  const taskRows = [
+    { id: 101, task_key: 'TASK-20261006-00000000-0000-0000-0000-000000000001', task_type: 'SEO_ANALYSIS', status: 'created', brand_id: 1, assigned_agent_id: 1, agent_key: 'digital_musik_seo', name: 'Raka', agent_type: 'SEO_AGENT' },
+    { id: 102, task_key: 'TASK-20261006-00000000-0000-0000-0000-000000000002', task_type: 'SEO_ANALYSIS', status: 'created', brand_id: 2, assigned_agent_id: 2, agent_key: 'audio_one_seo', name: 'Reno', agent_type: 'SEO_AGENT' },
+  ];
+  const db = {
+    async query({ sql, values }) {
+      if (sql.includes('FROM tasks') && values && values[0]) {
+        return [taskRows.filter(t => t.task_key === values[0])];
+      }
+      if (sql.includes('FROM tasks')) return [[]];
+      return [agentRows];
+    },
+  };
+  const executed = [];
+  const execute = async (key, gen, agentId) => {
+    executed.push({ key, agentId });
+    return {
+      status: 'completed',
+      result: {
+        keyword: 'jasa produksi speaker custom',
+        severity: 'high',
+        summary: 'Peringkat turun 12 posisi.',
+        recommended_actions: [{ action: 'Audit halaman landing', priority: 'P1' }],
+      },
+    };
+  };
+
+  // Test A: Raka executes via context reference "Jalankan task tadi"
+  const bodyA = {
+    role: 'digital_musik_seo',
+    lane: 'digital_musik_seo',
+    messages: [
+      { role: 'user', content: 'Analisa keyword jasa produksi speaker custom' },
+      { role: 'assistant', content: 'Task dibuat.\nTASK-20261006-00000000-0000-0000-0000-000000000001\nSEO Analysis\nAgent: Raka\nStatus: created' },
+      { role: 'user', content: 'Jalankan task tadi' },
+    ],
+  };
+  const resA = await request(db, '/hermes-runtime/v1/chat/completions', 'POST', bodyA, undefined, undefined, execute);
+  assert.equal(resA.status, 200);
+  const contentA = resA.body.choices[0].message.content;
+  assert.match(contentA, /Raka/);
+  assert.match(contentA, /Task: TASK-20261006-00000000-0000-0000-0000-000000000001/);
+  assert.match(contentA, /Status: completed/);
+  assert.match(contentA, /Keyword:\njasa produksi speaker custom/);
+  assert.match(contentA, /Severity:\nhigh/);
+  assert.match(contentA, /Summary:\nPeringkat turun 12 posisi\./);
+  assert.match(contentA, /Recommended actions:\n- \[P1\] Audit halaman landing/);
+  assert.equal(executed[0].key, 'TASK-20261006-00000000-0000-0000-0000-000000000001');
+  assert.equal(executed[0].agentId, 1);
+
+  // Test B: Audio One (Reno) executes via explicit "Execute TASK-..."
+  const bodyB = {
+    role: 'audio_one_seo',
+    lane: 'audio_one_seo',
+    messages: [
+      { role: 'user', content: 'Execute TASK-20261006-00000000-0000-0000-0000-000000000002' },
+    ],
+  };
+  const resB = await request(db, '/hermes-runtime/v1/chat/completions', 'POST', bodyB, undefined, undefined, execute);
+  assert.equal(resB.status, 200);
+  assert.equal(executed[1].key, 'TASK-20261006-00000000-0000-0000-0000-000000000002');
+  assert.equal(executed[1].agentId, 2);
+});
+
+test('TASK 020: security gate enforces ownership, role, valid state, and blocks rerun', async () => {
+  const agentRows = [
+    { id: 1, agent_key: 'digital_musik_seo', agent_type: 'SEO_AGENT', name: 'Raka', status: 'active', brand_key: 'digital_musik', brand_name: 'Digital Musik' },
+    { id: 2, agent_key: 'audio_one_seo', agent_type: 'SEO_AGENT', name: 'Reno', status: 'active', brand_key: 'audio_one', brand_name: 'Audio One' },
+    { id: 3, agent_key: 'digital_musik_content', agent_type: 'CONTENT_AGENT', name: 'Mira', status: 'active', brand_key: 'digital_musik', brand_name: 'Digital Musik' },
+  ];
+  const taskRows = [
+    { id: 101, task_key: 'TASK-20261006-00000000-0000-0000-0000-000000000001', task_type: 'SEO_ANALYSIS', status: 'created', brand_id: 1, assigned_agent_id: 1, agent_key: 'digital_musik_seo', name: 'Raka', agent_type: 'SEO_AGENT' },
+    { id: 102, task_key: 'TASK-20261006-00000000-0000-0000-0000-000000000002', task_type: 'SEO_ANALYSIS', status: 'completed', brand_id: 1, assigned_agent_id: 1, agent_key: 'digital_musik_seo', name: 'Raka', agent_type: 'SEO_AGENT' },
+  ];
+  const db = {
+    async query({ sql, values }) {
+      if (sql.includes('FROM tasks') && values && values[0]) {
+        return [taskRows.filter(t => t.task_key === values[0])];
+      }
+      if (sql.includes('FROM tasks')) return [[]];
+      return [agentRows];
+    },
+  };
+  let executedCount = 0;
+  const execute = async () => { executedCount += 1; return { status: 'completed', result: {} }; };
+
+  // Test C: Wrong owner (Reno tries to execute Raka task) -> DENY
+  const resC = await request(db, '/hermes-runtime/v1/chat/completions', 'POST', {
+    role: 'audio_one_seo',
+    lane: 'audio_one_seo',
+    messages: [{ role: 'user', content: 'Jalankan TASK-20261006-00000000-0000-0000-0000-000000000001' }],
+  }, undefined, undefined, execute);
+  assert.equal(resC.status, 200);
+  assert.match(resC.body.choices[0].message.content, /DENY/);
+  assert.equal(executedCount, 0);
+
+  // Test D: Wrong role (Mira / Content Agent tries to execute SEO task) -> DENY
+  const resD = await request(db, '/hermes-runtime/v1/chat/completions', 'POST', {
+    role: 'digital_musik_content',
+    lane: 'digital_musik_content',
+    messages: [{ role: 'user', content: 'Jalankan TASK-20261006-00000000-0000-0000-0000-000000000001' }],
+  }, undefined, undefined, execute);
+  assert.equal(resD.status, 200);
+  assert.match(resD.body.choices[0].message.content, /DENY/);
+  assert.equal(executedCount, 0);
+
+  // Test E: Completed task cannot be rerun
+  const resE = await request(db, '/hermes-runtime/v1/chat/completions', 'POST', {
+    role: 'digital_musik_seo',
+    lane: 'digital_musik_seo',
+    messages: [{ role: 'user', content: 'Jalankan TASK-20261006-00000000-0000-0000-0000-000000000002' }],
+  }, undefined, undefined, execute);
+  assert.equal(resE.status, 200);
+  assert.match(resE.body.choices[0].message.content, /sudah selesai \(completed\)/);
+  assert.equal(executedCount, 0);
+
+  // Test F: Malformed task key -> safe 400
+  const resF = await request(db, '/hermes-runtime/v1/chat/completions', 'POST', {
+    role: 'digital_musik_seo',
+    lane: 'digital_musik_seo',
+    messages: [{ role: 'user', content: 'Jalankan TASK-invalid123' }],
+  }, undefined, undefined, execute);
+  assert.equal(resF.status, 400);
+  assert.equal(resF.body.error, 'invalid_task_key');
+  assert.equal(executedCount, 0);
+
+  // Test G: Unknown task -> safe 404
+  const resG = await request(db, '/hermes-runtime/v1/chat/completions', 'POST', {
+    role: 'digital_musik_seo',
+    lane: 'digital_musik_seo',
+    messages: [{ role: 'user', content: 'Jalankan TASK-20261006-99999999-9999-9999-9999-999999999999' }],
+  }, undefined, undefined, execute);
+  assert.equal(resG.status, 404);
+  assert.equal(resG.body.error, 'task_not_found');
+  assert.equal(executedCount, 0);
+
+  // Conversational questions must not execute
+  for (const question of ['Task tadi gimana?', 'Sudah dianalisa?', 'Menurut kamu keyword ini bagus?', 'Apa hasilnya?']) {
+    const resQ = await request(db, '/hermes-runtime/v1/chat/completions', 'POST', {
+      role: 'digital_musik_seo',
+      lane: 'digital_musik_seo',
+      messages: [{ role: 'user', content: question }],
+    }, async () => ({ output: 'conversational answer' }), undefined, execute);
+    assert.equal(resQ.status, 200);
+    assert.equal(resQ.body.choices[0].message.content, 'conversational answer');
+  }
+  assert.equal(executedCount, 0);
+
+  // Context reference with no task in conversation asks user for key
+  const resNoContext = await request(db, '/hermes-runtime/v1/chat/completions', 'POST', {
+    role: 'digital_musik_seo',
+    lane: 'digital_musik_seo',
+    messages: [{ role: 'user', content: 'Jalankan task tadi' }],
+  }, undefined, undefined, execute);
+  assert.equal(resNoContext.status, 200);
+  assert.match(resNoContext.body.choices[0].message.content, /Tidak ditemukan referensi task/);
+
+  // Context reference with ambiguous (>1) tasks asks user for key
+  const resAmbiguous = await request(db, '/hermes-runtime/v1/chat/completions', 'POST', {
+    role: 'digital_musik_seo',
+    lane: 'digital_musik_seo',
+    messages: [
+      { role: 'assistant', content: 'TASK-20261006-00000000-0000-0000-0000-000000000001 dan TASK-20261006-00000000-0000-0000-0000-000000000002' },
+      { role: 'user', content: 'Jalankan task tadi' },
+    ],
+  }, undefined, undefined, execute);
+  assert.equal(resAmbiguous.status, 200);
+  assert.match(resAmbiguous.body.choices[0].message.content, /lebih dari satu referensi task/);
+  assert.equal(executedCount, 0);
+});
+
+test('TASK 020: concurrent double execution returns one 200 and one 409 conflict', async () => {
+  const agentRows = [
+    { id: 1, agent_key: 'digital_musik_seo', agent_type: 'SEO_AGENT', name: 'Raka', status: 'active', brand_key: 'digital_musik', brand_name: 'Digital Musik' },
+  ];
+  const taskRows = [
+    { id: 101, task_key: 'TASK-20261006-00000000-0000-0000-0000-000000000001', task_type: 'SEO_ANALYSIS', status: 'created', brand_id: 1, assigned_agent_id: 1, agent_key: 'digital_musik_seo', name: 'Raka', agent_type: 'SEO_AGENT' },
+  ];
+  const db = {
+    async query({ sql, values }) {
+      if (sql.includes('FROM tasks') && values && values[0]) {
+        return [taskRows.filter(t => t.task_key === values[0])];
+      }
+      if (sql.includes('FROM tasks')) return [[]];
+      return [agentRows];
+    },
+  };
+  let callCount = 0;
+  const execute = async () => {
+    callCount += 1;
+    if (callCount === 1) {
+      return { status: 'completed', result: { keyword: 'speaker', severity: 'high' } };
+    }
+    const err = new Error('task_not_executable');
+    err.httpStatus = 409;
+    err.publicCode = 'task_not_executable';
+    throw err;
+  };
+  const body = {
+    role: 'digital_musik_seo',
+    lane: 'digital_musik_seo',
+    messages: [
+      { role: 'assistant', content: 'TASK-20261006-00000000-0000-0000-0000-000000000001' },
+      { role: 'user', content: 'Jalankan task tadi' },
+    ],
+  };
+  const [res1, res2] = await Promise.all([
+    request(db, '/hermes-runtime/v1/chat/completions', 'POST', body, undefined, undefined, execute),
+    request(db, '/hermes-runtime/v1/chat/completions', 'POST', body, undefined, undefined, execute),
+  ]);
+  const statuses = [res1.status, res2.status].sort();
+  assert.deepEqual(statuses, [200, 409]);
+  const conflict = [res1, res2].find(r => r.status === 409);
+  assert.equal(conflict.body.error, 'task_not_executable');
 });
