@@ -173,7 +173,7 @@ const CEO_ROLE_TERMS = Object.freeze([
   ['DEVELOPER_AGENT', /\b(developer|code|kode|deploy(?:ment)?|infrastructure|infrastruktur|technical\s+implementation|implementasi\s+teknis)\b/iu],
   ['WEB_QC_AGENT', /\b(web\s*qc|website|situs|broken\s+page|404|500|missing\s+meta|site\s+health|page\s+validation)\b/iu],
 ]);
-const CEO_ACTION = /\b(?:kasih|beri|berikan|bikin)\s+tugas\b|\b(?:tolong(?:\s+cek)?|minta(?:\s+tim)?|suruh|delegasikan|delegasi(?:kan)?|buat(?:kan)?\s+task|create(?:\s+\w+){0,2}\s+task|assign|delegate|cek|periksa|audit)\b/iu;
+const CEO_ACTION = /\b(?:kasih|beri|berikan|bikin)\s+tugas\b|\b(?:tolong(?:\s+cek)?|minta(?:\s+tim)?|suruh|delegasikan|delegasi(?:kan)?|buat(?:kan)?\s+task|create(?:\s+\w+){0,2}\s+task|assign|delegate|cek|periksa|audit|analisa|analisis)\b/iu;
 const CEO_UNSAFE = /\b(?:ignore|abaikan|policy|kebijakan|admin[_ -]?shell|arbitrary\s+task|shell|publish|publikasi|wordpress|whatsapp|telegram|approve|setujui)\b/iu;
 
 function normalizeKeyword(value) {
@@ -353,14 +353,20 @@ async function handleChat(db, body, generate = generateChat, create = createTask
   const command = parseSeoCommand(latestUser);
   const webCommand = parseWebQcCommand(latestUser);
   const execution = parseExecutionIntent(latestUser);
-  const brandResolution = agent.metadata.agent_type === 'BRAND_CEO' ? resolveBrand(latestUser, agents) : null;
+  const routerAgent = ['BRAND_CEO', 'GROUP_CEO'].includes(agent.metadata.agent_type);
+  const brandResolution = routerAgent ? resolveBrand(latestUser, agents) : null;
   const targetCeo = brandResolution?.brand && brandResolution.brand.brand_key !== agent.metadata.brand_key
     ? agents.find(candidate => candidate.metadata.agent_type === 'BRAND_CEO' && candidate.metadata.brand_key === brandResolution.brand.brand_key) : agent;
   const routed = Boolean(targetCeo && targetCeo.id !== agent.id);
-  const delegation = agent.metadata.agent_type === 'BRAND_CEO'
+  let delegation = routerAgent
     ? (parseCeoDelegation(latestUser, agents) || (webCommand ? { targetRole: 'WEB_QC_AGENT' } : null)) : null;
+  if (agent.metadata.agent_type === 'GROUP_CEO' && delegation && delegation.requested && targetCeo && delegation.requested.metadata.brand_key !== targetCeo.metadata.brand_key) {
+    delegation = { ...delegation, requested: null };
+  }
   if (brandResolution?.conflict) {
     output = 'Permintaan menyebut lebih dari satu brand/domain terdaftar. Mohon tentukan target yang benar.';
+  } else if (agent.metadata.agent_type === 'GROUP_CEO' && delegation && !brandResolution?.brand) {
+    output = 'Mohon pilih satu brand: Digital Musik, Audio One, GG Audio, atau P.Audio. Tidak ada task yang dibuat.';
   } else if (delegation) {
     const delegatingCeo = targetCeo;
     if (!delegatingCeo || delegatingCeo.metadata.agent_type !== 'BRAND_CEO') {
