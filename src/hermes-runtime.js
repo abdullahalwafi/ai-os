@@ -155,6 +155,66 @@ function parseSeoCommand(text) {
   return { keyword };
 }
 
+const CEO_ROLE_TERMS = Object.freeze([
+  ['SEO_AGENT', /\b(seo|keyword|ranking|rank|search\s+visibility|visibilitas\s+pencarian)\b/iu],
+  ['CONTENT_AGENT', /\b(content|konten|artikel|caption|brief)\b/iu],
+  ['DEVELOPER_AGENT', /\b(developer|code|kode|deploy(?:ment)?|infrastructure|infrastruktur|technical\s+implementation|implementasi\s+teknis)\b/iu],
+  ['WEB_QC_AGENT', /\b(web\s*qc|website|situs|broken\s+page|404|500|missing\s+meta|site\s+health|page\s+validation)\b/iu],
+]);
+const CEO_ACTION = /\b(?:tolong\s+)?(?:suruh|delegasikan|delegasi(?:kan)?|buat(?:kan)?\s+task|create(?:\s+\w+){0,2}\s+task|assign|delegate)\b/iu;
+const CEO_UNSAFE = /\b(?:ignore|abaikan|policy|kebijakan|admin[_ -]?shell|arbitrary\s+task|shell|publish|publikasi|wordpress|whatsapp|telegram|approve|setujui)\b/iu;
+
+function normalizeKeyword(value) {
+  const keyword = typeof value === 'string' ? value.trim().replace(/^["“”']+|["“”'.]+$/g, '').trim() : '';
+  if (keyword.length < 2 || keyword.length > 120 || UNSAFE_KEYWORD.test(keyword) ||
+      !/^[\p{L}\p{N}][\p{L}\p{N}\s&+.'’/-]*$/u.test(keyword)) return null;
+  return keyword;
+}
+
+function requestedWorker(text, agents) {
+  const normalized = text.toLocaleLowerCase('id-ID');
+  const matches = agents.map(candidate => {
+    const key = candidate.id.toLocaleLowerCase('id-ID');
+    const name = candidate.name.toLocaleLowerCase('id-ID');
+    return { candidate, index: Math.max(normalized.lastIndexOf(key), normalized.lastIndexOf(name)) };
+  }).filter(match => match.index >= 0);
+  matches.sort((left, right) => right.index - left.index);
+  return matches[0]?.candidate || null;
+}
+
+function parseCeoDelegation(text, agents) {
+  if (typeof text !== 'string' || !CEO_ACTION.test(text)) return null;
+  const requested = requestedWorker(text, agents);
+  if (CEO_UNSAFE.test(text)) return { denied: 'Perintah delegasi tidak lolos safe command gate. Tidak ada task yang dibuat.' };
+  const targetRole = CEO_ROLE_TERMS.find(([, pattern]) => pattern.test(text))?.[0] || null;
+  if (requested && requested.metadata.brand_key !== null && !targetRole) return { requested };
+  if (!targetRole) return { denied: 'DENY: Jenis delegasi tidak didukung. Tidak ada task yang dibuat.' };
+  if (targetRole !== 'SEO_AGENT') return { targetRole, requested };
+  const match = /\bkeyword\s+(.+?)(?:\s+ke\s+(?:tim\s+)?seo)?[.!]?\s*$/iu.exec(text);
+  const keyword = normalizeKeyword(match?.[1]);
+  if (!keyword) return { denied: 'Permintaan SEO memerlukan keyword yang valid. Tidak ada task yang dibuat.' };
+  return { targetRole, requested, keyword };
+}
+
+function resolveDelegationWorker(ceo, decision, agents) {
+  if (decision.requested && decision.requested.metadata.brand_key !== ceo.metadata.brand_key) {
+    return { denied: `DENY: ${decision.requested.name} berada di brand lain. Brand CEO hanya dapat mendelegasikan ke worker brand sendiri.` };
+  }
+  const candidates = agents.filter(candidate => candidate.metadata.brand_key === ceo.metadata.brand_key &&
+    candidate.metadata.agent_type === decision.targetRole && candidate.metadata.presence_status !== 'offline');
+  if (decision.requested && (decision.requested.metadata.agent_type !== decision.targetRole || !candidates.some(candidate => candidate.id === decision.requested.id))) {
+    return { denied: `DENY: Target worker tidak sesuai dengan role delegasi ${decision.targetRole}.` };
+  }
+  if (candidates.length !== 1) {
+    return { denied: `Delegasi dihentikan: ditemukan ${candidates.length} worker aktif untuk role ${decision.targetRole}; target tidak dapat ditentukan dengan aman.` };
+  }
+  return { worker: candidates[0] };
+}
+
+function delegationRoleName(agentType) {
+  return ROLES[agentType] || agentType;
+}
+
 function commandKey(body, agentKey, messages) {
   const supplied = typeof body.idempotency_key === 'string' ? body.idempotency_key.trim() : '';
   const session = typeof body.session_id === 'string' ? body.session_id.trim() :
@@ -163,10 +223,10 @@ function commandKey(body, agentKey, messages) {
   return createHash('sha256').update(`${agentKey}\0${source}`).digest('hex');
 }
 
-async function createGatedTask(key, input, create) {
+async function createGatedTask(key, input, create, auditContext) {
   const existing = commandResults.get(key);
   if (existing) return { task: await existing, duplicate: true };
-  const promise = Promise.resolve().then(() => create(input));
+  const promise = Promise.resolve().then(() => create(input, auditContext));
   commandResults.set(key, promise);
   try {
     const result = await promise;
@@ -263,7 +323,30 @@ async function handleChat(db, body, generate = generateChat, create = createTask
   let output;
   const command = parseSeoCommand(latestUser);
   const execution = parseExecutionIntent(latestUser);
-  if (command?.invalid) {
+  const delegation = agent.metadata.agent_type === 'BRAND_CEO' ? parseCeoDelegation(latestUser, agents) : null;
+  if (delegation) {
+    if (delegation.denied) {
+      output = delegation.denied;
+    } else {
+      const resolution = resolveDelegationWorker(agent, delegation, agents);
+      if (resolution.denied) {
+        output = resolution.denied;
+      } else if (delegation.targetRole !== 'SEO_AGENT') {
+        output = `Permintaan ini cocok untuk ${resolution.worker.name} — ${delegationRoleName(delegation.targetRole)} ${agent.metadata.brand_name}. Capability ${delegationRoleName(delegation.targetRole)} execution belum diaktifkan, jadi belum ada task yang dibuat.`;
+      } else {
+        const { task, duplicate } = await createGatedTask(commandKey(body, agent.id, messages), {
+          brand_key: agent.metadata.brand_key,
+          agent_key: resolution.worker.id,
+          task_type: 'SEO_ANALYSIS',
+          title: `SEO Analysis: ${delegation.keyword}`,
+          description: `CEO-delegated keyword analysis for ${agent.metadata.brand_name}.`,
+          priority: 'P3',
+          payload: { keyword: delegation.keyword, source: 'hermes_ceo_delegation', delegated_by: agent.id },
+        }, create, { delegated_by_agent_id: agent.metadata.agent_id, delegated_by_agent_key: agent.id });
+        output = `${duplicate ? 'Task sudah tersedia.' : `Saya delegasikan ke ${resolution.worker.name} — SEO ${agent.metadata.brand_name}.`}\nTask:\n${task.task_key}\nType:\nSEO_ANALYSIS\nStatus:\n${task.status}\nTask belum dijalankan.`;
+      }
+    }
+  } else if (command?.invalid) {
     output = 'Perintah tidak lolos validasi safe command gate. Tidak ada task yang dibuat.';
   } else if (command) {
     if (agent.metadata.agent_type !== 'SEO_AGENT' || !agent.metadata.brand_key) {

@@ -32,7 +32,7 @@ async function audit(conn, task, action, context) {
     action === 'task.created' ? 'Task created' : 'Task status changed', JSON.stringify(context)]);
 }
 
-async function create(body) {
+async function create(body, auditContext = {}) {
   for (const [key, max] of Object.entries({ brand_key: 50, agent_key: 100, task_type: 100, title: 255 })) {
     if (typeof body[key] !== 'string' || !body[key].trim() || [...body[key]].length > max) fail(400, 'invalid_' + key);
   }
@@ -50,7 +50,7 @@ async function create(body) {
       (task_key,brand_id,assigned_agent_id,task_type,title,description,priority,status,payload_json)
       VALUES (?,?,?,?,?,?,?,'created',?)`, [key, brand.id, agent.id, body.task_type, body.title,
       body.description ?? null, body.priority, JSON.stringify(body.payload ?? {})]);
-    await audit(conn, { id: insert.insertId, brand_id: brand.id, assigned_agent_id: agent.id }, 'task.created', {});
+    await audit(conn, { id: insert.insertId, brand_id: brand.id, assigned_agent_id: agent.id }, 'task.created', auditContext);
     return detail(conn, key);
   });
 }
