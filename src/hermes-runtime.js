@@ -390,14 +390,16 @@ async function handleChat(db, body, generate = generateChat, create = createTask
           priority: 'P3',
           payload: { keyword: delegation.keyword, source: 'hermes_ceo_delegation', delegated_by: delegatingCeo.id, ...(routed ? { origin_agent_key: agent.id } : {}) },
         }, create, { delegated_by_agent_id: delegatingCeo.metadata.agent_id, delegated_by_agent_key: delegatingCeo.id, ...(routed ? { origin_agent_key: agent.id, rerouted: true } : {}) });
-        output = `${routed ? `Permintaan ini ditujukan ke ${delegatingCeo.metadata.brand_name}. Saya teruskan ke ${delegatingCeo.name} — CEO ${delegatingCeo.metadata.brand_name}.\n` : ''}${duplicate ? 'Task sudah tersedia.' : `Saya delegasikan ke ${resolution.worker.name} — SEO ${delegatingCeo.metadata.brand_name}.`}\nTask:\n${task.task_key}\nType:\nSEO_ANALYSIS\nStatus:\n${task.status}\nTask belum dijalankan.`;
+        const auto = agent.metadata.agent_type === 'GROUP_CEO' && !duplicate ? await execute(task.task_key, undefined, resolution.worker.metadata.agent_id) : null;
+        output = `${routed ? `Permintaan ini ditujukan ke ${delegatingCeo.metadata.brand_name}. Saya teruskan ke ${delegatingCeo.name} — CEO ${delegatingCeo.metadata.brand_name}.\n` : ''}${duplicate ? 'Task sudah tersedia.' : `Saya delegasikan ke ${resolution.worker.name} — SEO ${delegatingCeo.metadata.brand_name}.`}\nTask:\n${task.task_key}\nType:\nSEO_ANALYSIS\nStatus:\n${auto ? 'completed' : task.status}${auto ? `\n\nRouting: Wafi → ${delegatingCeo.name} → ${resolution.worker.name}\n\n${formatExecutionSummary(resolution.worker.name, task.task_key, auto.status, auto.result)}` : '\nTask belum dijalankan.'}`;
       } else {
         const { task, duplicate } = await createGatedTask(commandKey(body, agent.id, messages), {
           brand_key: delegatingCeo.metadata.brand_key, agent_key: resolution.worker.id, task_type: 'WEB_QC_CHECK',
           title: `Web QC Check: ${delegatingCeo.metadata.brand_name}`, description: `CEO-delegated read-only website check for ${delegatingCeo.metadata.brand_name}.`, priority: 'P3',
           payload: { source: 'hermes_ceo_delegation', delegated_by: delegatingCeo.id, ...(routed ? { origin_agent_key: agent.id } : {}) },
         }, create, { delegated_by_agent_id: delegatingCeo.metadata.agent_id, delegated_by_agent_key: delegatingCeo.id, ...(routed ? { origin_agent_key: agent.id, rerouted: true } : {}) });
-        output = `${routed ? `Permintaan ini ditujukan ke ${delegatingCeo.metadata.brand_name}. Saya teruskan ke ${delegatingCeo.name} — CEO ${delegatingCeo.metadata.brand_name}.\n` : ''}${duplicate ? 'Task sudah tersedia.' : `Saya delegasikan ke ${resolution.worker.name} — Web QC ${delegatingCeo.metadata.brand_name}.`}\nTask:\n${task.task_key}\nType:\nWEB_QC_CHECK\nStatus:\n${task.status}\nTask belum dijalankan.`;
+        const auto = agent.metadata.agent_type === 'GROUP_CEO' && !duplicate ? await execute(task.task_key, undefined, resolution.worker.metadata.agent_id) : null;
+        output = `${routed ? `Permintaan ini ditujukan ke ${delegatingCeo.metadata.brand_name}. Saya teruskan ke ${delegatingCeo.name} — CEO ${delegatingCeo.metadata.brand_name}.\n` : ''}${duplicate ? 'Task sudah tersedia.' : `Saya delegasikan ke ${resolution.worker.name} — Web QC ${delegatingCeo.metadata.brand_name}.`}\nTask:\n${task.task_key}\nType:\nWEB_QC_CHECK\nStatus:\n${auto ? 'completed' : task.status}${auto ? `\n\nRouting: Wafi → ${delegatingCeo.name} → ${resolution.worker.name}\n\n${formatExecutionSummary(resolution.worker.name, task.task_key, auto.status, auto.result)}` : '\nTask belum dijalankan.'}`;
       }
     }
     }
