@@ -105,6 +105,12 @@ function extractTaskKeysFromMessages(messages) {
 }
 
 function formatExecutionSummary(agentName, taskKey, status, result) {
+  if (result.check_type === 'WEB_QC_CHECK') {
+    const lines = [`${agentName}`, `Task: ${taskKey}`, `Status: ${status}`, '', `Homepage: ${result.homepage?.status ?? 'unreachable'}`, `robots.txt: ${result.robots?.present ? 'OK' : 'not found'}`, `sitemap: ${result.sitemap?.found ? 'FOUND' : 'not found'}`, '', 'Issues:'];
+    for (const item of result.issues || []) lines.push(`- [${item.severity}] ${item.message}`);
+    if (!(result.issues || []).length) lines.push('- Tidak ada temuan deterministik.');
+    return lines.join('\n');
+  }
   const lines = [
     `${agentName}`,
     `Task: ${taskKey}`,
@@ -153,6 +159,12 @@ function parseSeoCommand(text) {
   if (keyword.length < 2 || keyword.length > 120 || UNSAFE_KEYWORD.test(keyword) ||
       !/^[\p{L}\p{N}][\p{L}\p{N}\s&+.'’/-]*$/u.test(keyword)) return { invalid: true };
   return { keyword };
+}
+function parseWebQcCommand(text) {
+  if (typeof text !== 'string') return null;
+  if (/https?:\/\/|\b(?:127\.0\.0\.1|localhost|169\.254\.)/i.test(text)) return { invalid: true };
+  if (!/^\s*(?:cek|periksa|check)\s+(?:website|situs)\b/i.test(text)) return null;
+  return { check: true };
 }
 
 const CEO_ROLE_TERMS = Object.freeze([
@@ -322,6 +334,7 @@ async function handleChat(db, body, generate = generateChat, create = createTask
   const latestUser = [...messages].reverse().find(message => message.role === 'user').content;
   let output;
   const command = parseSeoCommand(latestUser);
+  const webCommand = parseWebQcCommand(latestUser);
   const execution = parseExecutionIntent(latestUser);
   const delegation = agent.metadata.agent_type === 'BRAND_CEO' ? parseCeoDelegation(latestUser, agents) : null;
   if (delegation) {
@@ -331,9 +344,9 @@ async function handleChat(db, body, generate = generateChat, create = createTask
       const resolution = resolveDelegationWorker(agent, delegation, agents);
       if (resolution.denied) {
         output = resolution.denied;
-      } else if (delegation.targetRole !== 'SEO_AGENT') {
+      } else if (!['SEO_AGENT', 'WEB_QC_AGENT'].includes(delegation.targetRole)) {
         output = `Permintaan ini cocok untuk ${resolution.worker.name} — ${delegationRoleName(delegation.targetRole)} ${agent.metadata.brand_name}. Capability ${delegationRoleName(delegation.targetRole)} execution belum diaktifkan, jadi belum ada task yang dibuat.`;
-      } else {
+      } else if (delegation.targetRole === 'SEO_AGENT') {
         const { task, duplicate } = await createGatedTask(commandKey(body, agent.id, messages), {
           brand_key: agent.metadata.brand_key,
           agent_key: resolution.worker.id,
@@ -344,9 +357,16 @@ async function handleChat(db, body, generate = generateChat, create = createTask
           payload: { keyword: delegation.keyword, source: 'hermes_ceo_delegation', delegated_by: agent.id },
         }, create, { delegated_by_agent_id: agent.metadata.agent_id, delegated_by_agent_key: agent.id });
         output = `${duplicate ? 'Task sudah tersedia.' : `Saya delegasikan ke ${resolution.worker.name} — SEO ${agent.metadata.brand_name}.`}\nTask:\n${task.task_key}\nType:\nSEO_ANALYSIS\nStatus:\n${task.status}\nTask belum dijalankan.`;
+      } else {
+        const { task, duplicate } = await createGatedTask(commandKey(body, agent.id, messages), {
+          brand_key: agent.metadata.brand_key, agent_key: resolution.worker.id, task_type: 'WEB_QC_CHECK',
+          title: `Web QC Check: ${agent.metadata.brand_name}`, description: `CEO-delegated read-only website check for ${agent.metadata.brand_name}.`, priority: 'P3',
+          payload: { source: 'hermes_ceo_delegation', delegated_by: agent.id },
+        }, create, { delegated_by_agent_id: agent.metadata.agent_id, delegated_by_agent_key: agent.id });
+        output = `${duplicate ? 'Task sudah tersedia.' : `Saya delegasikan ke ${resolution.worker.name} — Web QC ${agent.metadata.brand_name}.`}\nTask:\n${task.task_key}\nType:\nWEB_QC_CHECK\nStatus:\n${task.status}\nTask belum dijalankan.`;
       }
     }
-  } else if (command?.invalid) {
+  } else if (command?.invalid || webCommand?.invalid) {
     output = 'Perintah tidak lolos validasi safe command gate. Tidak ada task yang dibuat.';
   } else if (command) {
     if (agent.metadata.agent_type !== 'SEO_AGENT' || !agent.metadata.brand_key) {
@@ -363,9 +383,20 @@ async function handleChat(db, body, generate = generateChat, create = createTask
       }, create);
       output = `${duplicate ? 'Task sudah tersedia.' : 'Task dibuat.'}\n${task.task_key}\nSEO Analysis\nAgent: ${agent.name}\nStatus: ${task.status}`;
     }
+  } else if (webCommand) {
+    if (agent.metadata.agent_type !== 'WEB_QC_AGENT' || !agent.metadata.brand_key) {
+      output = `Capability WEB_QC_CHECK hanya tersedia untuk Web QC Agent. ${agent.name} tidak membuat task apa pun.`;
+    } else {
+      const { task, duplicate } = await createGatedTask(commandKey(body, agent.id, messages), {
+        brand_key: agent.metadata.brand_key, agent_key: agent.id, task_type: 'WEB_QC_CHECK',
+        title: `Web QC Check: ${agent.metadata.brand_name}`, description: `Read-only website check for ${agent.metadata.brand_name}.`, priority: 'P3',
+        payload: { source: 'hermes_chat' },
+      }, create);
+      output = `${duplicate ? 'Task sudah tersedia.' : 'Task dibuat.'}\n${task.task_key}\nWeb QC Check\nAgent: ${agent.name}\nStatus: ${task.status}`;
+    }
   } else if (execution) {
-    if (agent.metadata.agent_type !== 'SEO_AGENT') {
-      output = `DENY: Capability eksekusi task hanya diizinkan untuk SEO Agent. ${agent.name} tidak dapat menjalankan task apa pun.`;
+    if (!['SEO_AGENT', 'WEB_QC_AGENT'].includes(agent.metadata.agent_type)) {
+      output = `DENY: Capability eksekusi task hanya diizinkan untuk SEO Agent atau Web QC Agent. ${agent.name} tidak dapat menjalankan task apa pun.`;
     } else if (agent.metadata.presence_status === 'offline') {
       output = `DENY: Agent ${agent.name} sedang offline dan tidak dapat menjalankan task.`;
     } else if (execution.malformed) {
@@ -404,8 +435,10 @@ async function handleChat(db, body, generate = generateChat, create = createTask
           throw error;
         } else if (taskRow.assigned_agent_id !== agent.metadata.agent_id && taskRow.agent_key !== agent.id) {
           output = `DENY: Agent ${agent.name} (${agent.id}) tidak memiliki izin untuk menjalankan task ${taskKey} yang ditugaskan ke agent lain.`;
-        } else if (taskRow.task_type !== 'SEO_ANALYSIS') {
-          output = `DENY: Task ${taskKey} bertipe ${taskRow.task_type}. Hanya task SEO_ANALYSIS yang diizinkan untuk dieksekusi.`;
+        } else if ((taskRow.task_type === 'SEO_ANALYSIS' && agent.metadata.agent_type !== 'SEO_AGENT') || (taskRow.task_type === 'WEB_QC_CHECK' && agent.metadata.agent_type !== 'WEB_QC_AGENT')) {
+          output = `DENY: Task ${taskKey} tidak sesuai dengan role agent ${agent.name}.`;
+        } else if (!['SEO_ANALYSIS', 'WEB_QC_CHECK'].includes(taskRow.task_type)) {
+          output = `DENY: Task ${taskKey} bertipe ${taskRow.task_type} tidak dapat dieksekusi.`;
         } else if (taskRow.status === 'completed') {
           output = `Task ${taskKey} sudah selesai (completed) dan tidak dapat dijalankan ulang.`;
         } else if (taskRow.status === 'running') {
