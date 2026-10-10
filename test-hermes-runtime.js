@@ -196,7 +196,8 @@ test('TASK 021: Brand CEOs delegate only same-brand SEO tasks and never auto-exe
   assert.match(crossBrand.body.choices[0].message.content, /DENY/);
   const content = await delegate('digital_musik_ceo', 'Suruh Mira buat artikel tentang speaker OEM.', 'content');
   assert.match(content.body.choices[0].message.content, /Mira/);
-  assert.match(content.body.choices[0].message.content, /belum diaktifkan/);
+  assert.match(content.body.choices[0].message.content, /CONTENT_ARTICLE_DRAFT/);
+  assert.match(content.body.choices[0].message.content, /Task belum dijalankan/);
   const webQc = await delegate('audio_one_ceo', 'Suruh Kira cek website.', 'web-qc');
   assert.match(webQc.body.choices[0].message.content, /Kira/);
   assert.match(webQc.body.choices[0].message.content, /WEB_QC_CHECK/);
@@ -208,7 +209,7 @@ test('TASK 021: Brand CEOs delegate only same-brand SEO tasks and never auto-exe
   assert.match(arbitrary.body.choices[0].message.content, /safe command gate/);
   const normal = await delegate('digital_musik_ceo', 'Menurut kamu SEO kita gimana?', 'normal');
   assert.equal(normal.body.choices[0].message.content, 'reasoning only');
-  assert.equal(created.length, 6);
+  assert.equal(created.length, 7);
   assert.equal(executed, 0);
 });
 
@@ -227,6 +228,58 @@ test('chat write gate rejects reverse-proxied requests before DB or task access'
   assert.deepEqual(result, { status: 404, body: { error: 'not_found' } });
   assert.equal(accessed, false);
   assert.equal(created, false);
+});
+
+test('TASK 026B: Wafi routes a Digital Musik article draft only to Mira and auto-executes only that supported content task', async () => {
+  const rows = [
+    { id: 1, agent_key: 'group_ceo', agent_type: 'GROUP_CEO', name: 'Wafi', status: 'active', brand_key: null, brand_name: null },
+    { id: 2, agent_key: 'digital_musik_ceo', agent_type: 'BRAND_CEO', name: 'Nara', status: 'active', brand_key: 'digital_musik', brand_name: 'Digital Musik' },
+    { id: 3, agent_key: 'digital_musik_content', agent_type: 'CONTENT_AGENT', name: 'Mira', status: 'active', brand_key: 'digital_musik', brand_name: 'Digital Musik' },
+    { id: 4, agent_key: 'audio_one_ceo', agent_type: 'BRAND_CEO', name: 'Arka', status: 'active', brand_key: 'audio_one', brand_name: 'Audio One' },
+    { id: 5, agent_key: 'audio_one_content', agent_type: 'CONTENT_AGENT', name: 'Luna', status: 'active', brand_key: 'audio_one', brand_name: 'Audio One' },
+  ];
+  const db = { async query({ sql }) { return sql.includes('FROM tasks') ? [[]] : [rows]; } };
+  const created = [];
+  const create = async (input, audit) => {
+    created.push({ input, audit });
+    return { task_key: 'TASK-CONTENT-1', status: 'created', task_type: input.task_type };
+  };
+  const executed = [];
+  const execute = async (taskKey, _generate, agentId) => {
+    executed.push({ taskKey, agentId });
+    return { status: 'completed', result: {
+      source: 'digital_musik_article_generator', generation_id: 'gen-1', article_id: 262,
+      status: 'draft', title: 'Jasa Produksi Speaker OEM', word_count: 1200, published_at: null,
+    } };
+  };
+  const response = await request(db, '/hermes-runtime/v1/chat/completions', 'POST', {
+    role: 'group_ceo', lane: 'group_ceo', session_id: 'task-026b-wafi', idempotency_key: 'task-026b-wafi',
+    messages: [{ role: 'user', content: 'buat artikel Digital Musik keyword jasa produksi speaker OEM' }],
+  }, undefined, create, execute);
+  assert.equal(response.status, 200);
+  assert.equal(created.length, 1, response.body.choices[0].message.content);
+  assert.equal(created[0].input.task_type, 'CONTENT_ARTICLE_DRAFT');
+  assert.equal(created[0].input.brand_key, 'digital_musik');
+  assert.equal(created[0].input.agent_key, 'digital_musik_content');
+  assert.equal(created[0].input.payload.primary_keyword, 'jasa produksi speaker OEM');
+  assert.equal(executed[0].agentId, 3);
+  assert.match(response.body.choices[0].message.content, /Artikel belum dipublish/);
+
+  const otherBrand = await request(db, '/hermes-runtime/v1/chat/completions', 'POST', {
+    role: 'group_ceo', lane: 'group_ceo', session_id: 'task-026b-audio-one', idempotency_key: 'task-026b-audio-one',
+    messages: [{ role: 'user', content: 'buat artikel Audio One tentang sound system' }],
+  }, undefined, create, execute);
+  assert.match(otherBrand.body.choices[0].message.content, /Luna/);
+  assert.match(otherBrand.body.choices[0].message.content, /adapter.*belum diaktifkan/i);
+  assert.equal(created.length, 1);
+
+  const direct = await request(db, '/hermes-runtime/v1/chat/completions', 'POST', {
+    role: 'digital_musik_content', lane: 'digital_musik_content', session_id: 'task-026b-mira', idempotency_key: 'task-026b-mira',
+    messages: [{ role: 'user', content: 'Buat draft artikel keyword jasa produksi speaker OEM' }],
+  }, undefined, create, execute);
+  assert.match(direct.body.choices[0].message.content, /CONTENT_ARTICLE_DRAFT/);
+  assert.equal(created.length, 2);
+  assert.equal(created[1].input.agent_key, 'digital_musik_content');
 });
 
 test('unsupported, ambiguous, wrong-role, and injection commands create no task', async () => {

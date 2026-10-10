@@ -15,6 +15,7 @@ const fields = `t.task_key, b.brand_key, b.name AS brand_name,
   t.priority, t.status, t.created_at, t.started_at, t.completed_at`;
 const joins = 'FROM tasks t LEFT JOIN brands b ON b.id=t.brand_id LEFT JOIN agents a ON a.id=t.assigned_agent_id';
 const { fail, readJson, transaction } = require("./request-utils");
+const { normalizeArticleBrief } = require('./article-brief');
 
 async function detail(conn, key) {
   const [rows] = await conn.execute(`SELECT ${fields}, t.description,
@@ -45,6 +46,12 @@ async function create(body, auditContext = {}) {
     const [[agent]] = await conn.execute('SELECT id, brand_id, agent_type, status FROM agents WHERE agent_key=? FOR SHARE', [body.agent_key]);
     if (!agent || agent.status !== 'active') fail(400, 'invalid_agent');
     if (agent.brand_id !== brand.id && !(agent.agent_type === 'GROUP_CEO' && agent.brand_id === null)) fail(400, 'agent_brand_mismatch');
+    if (body.task_type === 'CONTENT_ARTICLE_DRAFT') {
+      if (body.brand_key !== 'digital_musik' || body.agent_key !== 'digital_musik_content' || agent.agent_type !== 'CONTENT_AGENT') {
+        fail(400, 'invalid_content_article_draft_target');
+      }
+      body = { ...body, payload: normalizeArticleBrief(body.payload) };
+    }
     const key = 'TASK-' + new Date().toISOString().slice(0, 10).replaceAll('-', '') + '-' + randomUUID();
     const [insert] = await conn.execute(`INSERT INTO tasks
       (task_key,brand_id,assigned_agent_id,task_type,title,description,priority,status,payload_json)

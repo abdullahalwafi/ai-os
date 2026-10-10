@@ -7,6 +7,7 @@ const { generateChat } = require('./llm');
 const { LLMError } = require('./llm/provider');
 const { createTask } = require('./tasks');
 const { executeTask } = require('./worker-executor');
+const { normalizeArticleBrief } = require('./article-brief');
 
 const PREFIX = '/hermes-runtime';
 const ROLES = Object.freeze({
@@ -66,6 +67,14 @@ async function readAgents(db) {
 const ACTION_REQUEST = /\b(publish|execute|run|restart|create\s+(?:a\s+)?(?:task|database|db|table)|buat\s+(?:database|db|tabel)|change\s+(?:the\s+)?status|modify|delete|approve|send|deploy|write|update|posting|post|publikasi|terbitkan|jalankan|buat\s+tugas|ubah|hapus|setujui|kirim)\b/i;
 const UNSAFE_KEYWORD = /\b(ignore|abaikan|policy|kebijakan|instruksi|prompt|developer\s+task|arbitrary|publish|publikasi|deploy|shell|hapus|delete|whatsapp|telegram|wordpress|approve|setujui)\b/i;
 const commandResults = new Map();
+const presentationEvents = [];
+let presentationSequence = 0;
+function emitPresentation(event_type, task, from_agent, to_agent, metadata = {}) {
+  presentationEvents.push({ event_id: `presentation-${++presentationSequence}`, sequence: presentationSequence,
+    timestamp: new Date().toISOString(), task_id: task?.task_key ?? null, brand: task?.brand_key ?? null,
+    event_type, from_agent, to_agent, task_status: task?.status ?? null, metadata });
+  if (presentationEvents.length > 80) presentationEvents.splice(0, presentationEvents.length - 80);
+}
 
 function parseExecutionIntent(text) {
   if (typeof text !== 'string') return null;
@@ -105,6 +114,21 @@ function extractTaskKeysFromMessages(messages) {
 }
 
 function formatExecutionSummary(agentName, taskKey, status, result) {
+  if (result.source === 'digital_musik_article_generator') {
+    const lines = [
+      agentName,
+      `Task: ${taskKey}`,
+      `Status: ${status}`,
+      '',
+      `Title: ${result.title || 'Draft artikel'}`,
+      `Article ID: ${result.article_id ?? 'unknown'}`,
+      `Draft status: ${result.status || 'draft'}`,
+      `Word count: ${result.word_count ?? 'unknown'}`,
+      '',
+      'Artikel belum dipublish.',
+    ];
+    return lines.join('\n');
+  }
   if (result.check_type === 'WEB_QC_CHECK') {
     const lines = [`${agentName}`, `Task: ${taskKey}`, `Status: ${status}`, '', `Homepage: ${result.homepage?.status ?? 'unreachable'}`, `robots.txt: ${result.robots?.present ? 'OK' : 'not found'}`, `sitemap: ${result.sitemap?.found ? 'FOUND' : 'not found'}`, '', 'Issues:'];
     for (const item of result.issues || []) lines.push(`- [${item.severity}] ${item.message}`);
@@ -173,7 +197,7 @@ const CEO_ROLE_TERMS = Object.freeze([
   ['DEVELOPER_AGENT', /\b(developer|code|kode|deploy(?:ment)?|infrastructure|infrastruktur|technical\s+implementation|implementasi\s+teknis)\b/iu],
   ['WEB_QC_AGENT', /\b(web\s*qc|website|situs|broken\s+page|404|500|missing\s+meta|site\s+health|page\s+validation)\b/iu],
 ]);
-const CEO_ACTION = /\b(?:kasih|beri|berikan|bikin)\s+tugas\b|\b(?:tolong(?:\s+cek)?|minta(?:\s+tim)?|suruh|delegasikan|delegasi(?:kan)?|buat(?:kan)?\s+task|create(?:\s+\w+){0,2}\s+task|assign|delegate|cek|periksa|audit|analisa|analisis)\b/iu;
+const CEO_ACTION = /\b(?:kasih|beri|berikan|bikin)\s+tugas\b|\b(?:tolong(?:\s+cek)?|minta(?:\s+tim)?|suruh|delegasikan|delegasi(?:kan)?|buat(?:kan)?\s+task|(?:buat|bikin)(?:kan)?\s+(?:draft\s+)?artikel|create(?:\s+\w+){0,2}\s+task|assign|delegate|cek|periksa|audit|analisa|analisis)\b/iu;
 const CEO_UNSAFE = /\b(?:ignore|abaikan|policy|kebijakan|admin[_ -]?shell|arbitrary\s+task|shell|publish|publikasi|wordpress|whatsapp|telegram|approve|setujui)\b/iu;
 
 function normalizeKeyword(value) {
@@ -194,13 +218,36 @@ function requestedWorker(text, agents) {
   return matches[0]?.candidate || null;
 }
 
+function parseArticleBrief(text) {
+  const keywordMatch = /\bkeyword\s+(.+?)(?:[.!?]|$)/iu.exec(text);
+  const primaryKeyword = normalizeKeyword(keywordMatch?.[1]);
+  const topicMatch = /\btentang\s+(.+?)(?=\s+\bkeyword\b|[.!?]|$)/iu.exec(text);
+  const topic = topicMatch?.[1]?.trim().replace(/\s+/g, ' ') || null;
+  if (topic && (topic.length < 2 || topic.length > 300 || CEO_UNSAFE.test(topic))) return { invalid: true };
+  if (keywordMatch && !primaryKeyword) return { invalid: true };
+  if (!topic && !primaryKeyword) return { missing: true };
+  try {
+    return { brief: normalizeArticleBrief({
+      topic: topic || undefined,
+      primary_keyword: primaryKeyword || undefined,
+      secondary_keywords: [], required_sections: [], required_facts: [],
+      forbidden_claims: [], internal_link_candidates: [],
+    }) };
+  } catch { return { invalid: true }; }
+}
+
 function parseCeoDelegation(text, agents) {
   if (typeof text !== 'string' || !CEO_ACTION.test(text)) return null;
   const requested = requestedWorker(text, agents);
   if (CEO_UNSAFE.test(text)) return { denied: 'Perintah delegasi tidak lolos safe command gate. Tidak ada task yang dibuat.' };
-  const targetRole = CEO_ROLE_TERMS.find(([, pattern]) => pattern.test(text))?.[0] || null;
+  // Article intent wins over a keyword mention: a requested primary keyword
+  // describes Mira's brief, not an instruction to create an SEO task.
+  const targetRole = /\b(?:draft\s+)?artikel\b/iu.test(text)
+    ? 'CONTENT_AGENT'
+    : CEO_ROLE_TERMS.find(([, pattern]) => pattern.test(text))?.[0] || null;
   if (requested && requested.metadata.brand_key !== null && !targetRole) return { requested };
   if (!targetRole) return { denied: 'DENY: Jenis delegasi tidak didukung. Tidak ada task yang dibuat.' };
+  if (targetRole === 'CONTENT_AGENT') return { targetRole, requested, article: parseArticleBrief(text) };
   if (targetRole !== 'SEO_AGENT') return { targetRole, requested };
   const match = /\bkeyword\s+(.+?)(?:\s+ke\s+(?:tim\s+)?seo)?[.!]?\s*$/iu.exec(text);
   const keyword = normalizeKeyword(match?.[1]);
@@ -352,6 +399,8 @@ async function handleChat(db, body, generate = generateChat, create = createTask
   let output;
   const command = parseSeoCommand(latestUser);
   const webCommand = parseWebQcCommand(latestUser);
+  const articleCommand = /\b(?:buat|bikin)(?:kan)?\s+(?:draft\s+)?artikel\b/iu.test(latestUser)
+    ? parseArticleBrief(latestUser) : null;
   const execution = parseExecutionIntent(latestUser);
   const routerAgent = ['BRAND_CEO', 'GROUP_CEO'].includes(agent.metadata.agent_type);
   const brandResolution = routerAgent ? resolveBrand(latestUser, agents) : null;
@@ -378,8 +427,47 @@ async function handleChat(db, body, generate = generateChat, create = createTask
       const resolution = resolveDelegationWorker(delegatingCeo, delegation, agents);
       if (resolution.denied) {
         output = resolution.denied;
+      } else if (delegation.targetRole === 'CONTENT_AGENT' &&
+        delegatingCeo.metadata.brand_key === 'digital_musik' && resolution.worker.id === 'digital_musik_content') {
+        if (delegation.article?.missing) {
+          output = 'Draft artikel Digital Musik memerlukan topik atau primary keyword. Tidak ada task yang dibuat.';
+        } else if (delegation.article?.invalid || !delegation.article?.brief) {
+          output = 'Input draft artikel tidak valid. Tidak ada task yang dibuat.';
+        } else {
+          const { task, duplicate } = await createGatedTask(commandKey(body, agent.id, messages), {
+            brand_key: 'digital_musik', agent_key: 'digital_musik_content', task_type: 'CONTENT_ARTICLE_DRAFT',
+            title: `Article Draft: ${delegation.article.brief.topic}`, description: 'CEO-delegated Digital Musik article draft.', priority: 'P3',
+            payload: { ...delegation.article.brief, source: 'hermes_ceo_delegation', delegated_by: delegatingCeo.id,
+              ...(routed ? { origin_agent_key: agent.id } : {}) },
+          }, create, { delegated_by_agent_id: delegatingCeo.metadata.agent_id, delegated_by_agent_key: delegatingCeo.id,
+            ...(routed ? { origin_agent_key: agent.id, rerouted: true } : {}) });
+          if (agent.metadata.agent_type === 'GROUP_CEO' && !duplicate) {
+            emitPresentation('WAFI_TO_CEO', task, agent.id, delegatingCeo.id);
+            emitPresentation('CEO_TO_WORKER', task, delegatingCeo.id, resolution.worker.id);
+          }
+          let auto = null; let autoError = null;
+          if (agent.metadata.agent_type === 'GROUP_CEO' && !duplicate) {
+            try { auto = await execute(task.task_key, undefined, resolution.worker.metadata.agent_id); }
+            catch (error) { autoError = error; }
+          }
+          if (auto || autoError) {
+            emitPresentation('WORKER_TO_CEO', task, resolution.worker.id, delegatingCeo.id,
+              auto ? { result_ready: true } : { failed: true });
+            emitPresentation('CEO_REVIEW', task, delegatingCeo.id, delegatingCeo.id);
+            emitPresentation('CEO_TO_WAFI', task, delegatingCeo.id, agent.id);
+            emitPresentation('WAFI_PRESENTATION', task, agent.id, agent.id);
+          }
+          if (autoError) {
+            output = `Draft artikel Digital Musik gagal dibuat.\nTask:\n${task.task_key}\nStatus:\nfailed\n\nTidak ada artikel yang dipublish.`;
+          } else {
+            output = `${routed ? `Permintaan ini ditujukan ke Digital Musik. Saya teruskan ke ${delegatingCeo.name} — CEO Digital Musik.\n` : ''}${duplicate ? 'Task sudah tersedia.' : `Saya delegasikan ke ${resolution.worker.name} — Content Digital Musik.`}\nTask:\n${task.task_key}\nType:\nCONTENT_ARTICLE_DRAFT\nStatus:\n${auto ? 'completed' : task.status}${auto ? `\n\nRouting: Wafi → ${delegatingCeo.name} → ${resolution.worker.name}\n\n${formatExecutionSummary(resolution.worker.name, task.task_key, auto.status, auto.result)}` : '\nTask belum dijalankan.'}`;
+          }
+        }
       } else if (!['SEO_AGENT', 'WEB_QC_AGENT'].includes(delegation.targetRole)) {
-        output = `${routed ? `Permintaan diteruskan ke ${delegatingCeo.name} — CEO ${delegatingCeo.metadata.brand_name}.\n` : ''}Permintaan ini cocok untuk ${resolution.worker.name} — ${delegationRoleName(delegation.targetRole)} ${delegatingCeo.metadata.brand_name}. Capability ${delegationRoleName(delegation.targetRole)} execution belum diaktifkan, jadi belum ada task yang dibuat.`;
+        const unavailable = delegation.targetRole === 'CONTENT_AGENT'
+          ? `Article generator adapter untuk ${delegatingCeo.metadata.brand_name} belum diaktifkan`
+          : `Capability ${delegationRoleName(delegation.targetRole)} execution belum diaktifkan`;
+        output = `${routed ? `Permintaan diteruskan ke ${delegatingCeo.name} — CEO ${delegatingCeo.metadata.brand_name}.\n` : ''}Permintaan ini cocok untuk ${resolution.worker.name} — ${delegationRoleName(delegation.targetRole)} ${delegatingCeo.metadata.brand_name}. ${unavailable}, jadi belum ada task yang dibuat.`;
       } else if (delegation.targetRole === 'SEO_AGENT') {
         const { task, duplicate } = await createGatedTask(commandKey(body, agent.id, messages), {
           brand_key: delegatingCeo.metadata.brand_key,
@@ -390,7 +478,9 @@ async function handleChat(db, body, generate = generateChat, create = createTask
           priority: 'P3',
           payload: { keyword: delegation.keyword, source: 'hermes_ceo_delegation', delegated_by: delegatingCeo.id, ...(routed ? { origin_agent_key: agent.id } : {}) },
         }, create, { delegated_by_agent_id: delegatingCeo.metadata.agent_id, delegated_by_agent_key: delegatingCeo.id, ...(routed ? { origin_agent_key: agent.id, rerouted: true } : {}) });
+        if (agent.metadata.agent_type === 'GROUP_CEO' && !duplicate) { emitPresentation('WAFI_TO_CEO', task, agent.id, delegatingCeo.id); emitPresentation('CEO_TO_WORKER', task, delegatingCeo.id, resolution.worker.id); }
         const auto = agent.metadata.agent_type === 'GROUP_CEO' && !duplicate ? await execute(task.task_key, undefined, resolution.worker.metadata.agent_id) : null;
+        if (auto) { emitPresentation('WORKER_TO_CEO', task, resolution.worker.id, delegatingCeo.id, { result_ready: true }); emitPresentation('CEO_REVIEW', task, delegatingCeo.id, delegatingCeo.id); emitPresentation('CEO_TO_WAFI', task, delegatingCeo.id, agent.id); emitPresentation('WAFI_PRESENTATION', task, agent.id, agent.id); }
         output = `${routed ? `Permintaan ini ditujukan ke ${delegatingCeo.metadata.brand_name}. Saya teruskan ke ${delegatingCeo.name} — CEO ${delegatingCeo.metadata.brand_name}.\n` : ''}${duplicate ? 'Task sudah tersedia.' : `Saya delegasikan ke ${resolution.worker.name} — SEO ${delegatingCeo.metadata.brand_name}.`}\nTask:\n${task.task_key}\nType:\nSEO_ANALYSIS\nStatus:\n${auto ? 'completed' : task.status}${auto ? `\n\nRouting: Wafi → ${delegatingCeo.name} → ${resolution.worker.name}\n\n${formatExecutionSummary(resolution.worker.name, task.task_key, auto.status, auto.result)}` : '\nTask belum dijalankan.'}`;
       } else {
         const { task, duplicate } = await createGatedTask(commandKey(body, agent.id, messages), {
@@ -398,7 +488,9 @@ async function handleChat(db, body, generate = generateChat, create = createTask
           title: `Web QC Check: ${delegatingCeo.metadata.brand_name}`, description: `CEO-delegated read-only website check for ${delegatingCeo.metadata.brand_name}.`, priority: 'P3',
           payload: { source: 'hermes_ceo_delegation', delegated_by: delegatingCeo.id, ...(routed ? { origin_agent_key: agent.id } : {}) },
         }, create, { delegated_by_agent_id: delegatingCeo.metadata.agent_id, delegated_by_agent_key: delegatingCeo.id, ...(routed ? { origin_agent_key: agent.id, rerouted: true } : {}) });
+        if (agent.metadata.agent_type === 'GROUP_CEO' && !duplicate) { emitPresentation('WAFI_TO_CEO', task, agent.id, delegatingCeo.id); emitPresentation('CEO_TO_WORKER', task, delegatingCeo.id, resolution.worker.id); }
         const auto = agent.metadata.agent_type === 'GROUP_CEO' && !duplicate ? await execute(task.task_key, undefined, resolution.worker.metadata.agent_id) : null;
+        if (auto) { emitPresentation('WORKER_TO_CEO', task, resolution.worker.id, delegatingCeo.id, { result_ready: true }); emitPresentation('CEO_REVIEW', task, delegatingCeo.id, delegatingCeo.id); emitPresentation('CEO_TO_WAFI', task, delegatingCeo.id, agent.id); emitPresentation('WAFI_PRESENTATION', task, agent.id, agent.id); }
         output = `${routed ? `Permintaan ini ditujukan ke ${delegatingCeo.metadata.brand_name}. Saya teruskan ke ${delegatingCeo.name} — CEO ${delegatingCeo.metadata.brand_name}.\n` : ''}${duplicate ? 'Task sudah tersedia.' : `Saya delegasikan ke ${resolution.worker.name} — Web QC ${delegatingCeo.metadata.brand_name}.`}\nTask:\n${task.task_key}\nType:\nWEB_QC_CHECK\nStatus:\n${auto ? 'completed' : task.status}${auto ? `\n\nRouting: Wafi → ${delegatingCeo.name} → ${resolution.worker.name}\n\n${formatExecutionSummary(resolution.worker.name, task.task_key, auto.status, auto.result)}` : '\nTask belum dijalankan.'}`;
       }
     }
@@ -431,9 +523,23 @@ async function handleChat(db, body, generate = generateChat, create = createTask
       }, create);
       output = `${duplicate ? 'Task sudah tersedia.' : 'Task dibuat.'}\n${task.task_key}\nWeb QC Check\nAgent: ${agent.name}\nStatus: ${task.status}`;
     }
+  } else if (articleCommand) {
+    if (articleCommand.invalid || articleCommand.missing || !articleCommand.brief) {
+      output = 'Draft artikel memerlukan topik atau primary keyword yang valid. Tidak ada task yang dibuat.';
+    } else if (agent.metadata.agent_type !== 'CONTENT_AGENT' || agent.id !== 'digital_musik_content' || agent.metadata.brand_key !== 'digital_musik') {
+      output = `Capability CONTENT_ARTICLE_DRAFT hanya tersedia untuk Mira — Content Digital Musik. ${agent.name} tidak membuat task apa pun.`;
+    } else {
+      const { task, duplicate } = await createGatedTask(commandKey(body, agent.id, messages), {
+        brand_key: 'digital_musik', agent_key: 'digital_musik_content', task_type: 'CONTENT_ARTICLE_DRAFT',
+        title: `Article Draft: ${articleCommand.brief.topic}`, description: 'Digital Musik article draft request.', priority: 'P3',
+        payload: { ...articleCommand.brief, source: 'hermes_chat' },
+      }, create);
+      output = `${duplicate ? 'Task sudah tersedia.' : 'Task dibuat.'}\n${task.task_key}\nCONTENT_ARTICLE_DRAFT\nAgent: ${agent.name}\nStatus: ${task.status}`;
+    }
   } else if (execution) {
-    if (!['SEO_AGENT', 'WEB_QC_AGENT'].includes(agent.metadata.agent_type)) {
-      output = `DENY: Capability eksekusi task hanya diizinkan untuk SEO Agent atau Web QC Agent. ${agent.name} tidak dapat menjalankan task apa pun.`;
+    const canExecuteContent = agent.metadata.agent_type === 'CONTENT_AGENT' && agent.id === 'digital_musik_content' && agent.metadata.brand_key === 'digital_musik';
+    if (!['SEO_AGENT', 'WEB_QC_AGENT'].includes(agent.metadata.agent_type) && !canExecuteContent) {
+      output = `DENY: Capability eksekusi task tidak diizinkan untuk ${agent.name}.`;
     } else if (agent.metadata.presence_status === 'offline') {
       output = `DENY: Agent ${agent.name} sedang offline dan tidak dapat menjalankan task.`;
     } else if (execution.malformed) {
@@ -472,9 +578,9 @@ async function handleChat(db, body, generate = generateChat, create = createTask
           throw error;
         } else if (taskRow.assigned_agent_id !== agent.metadata.agent_id && taskRow.agent_key !== agent.id) {
           output = `DENY: Agent ${agent.name} (${agent.id}) tidak memiliki izin untuk menjalankan task ${taskKey} yang ditugaskan ke agent lain.`;
-        } else if ((taskRow.task_type === 'SEO_ANALYSIS' && agent.metadata.agent_type !== 'SEO_AGENT') || (taskRow.task_type === 'WEB_QC_CHECK' && agent.metadata.agent_type !== 'WEB_QC_AGENT')) {
+        } else if ((taskRow.task_type === 'SEO_ANALYSIS' && agent.metadata.agent_type !== 'SEO_AGENT') || (taskRow.task_type === 'WEB_QC_CHECK' && agent.metadata.agent_type !== 'WEB_QC_AGENT') || (taskRow.task_type === 'CONTENT_ARTICLE_DRAFT' && !canExecuteContent)) {
           output = `DENY: Task ${taskKey} tidak sesuai dengan role agent ${agent.name}.`;
-        } else if (!['SEO_ANALYSIS', 'WEB_QC_CHECK'].includes(taskRow.task_type)) {
+        } else if (!['SEO_ANALYSIS', 'WEB_QC_CHECK', 'CONTENT_ARTICLE_DRAFT'].includes(taskRow.task_type)) {
           output = `DENY: Task ${taskKey} bertipe ${taskRow.task_type} tidak dapat dieksekusi.`;
         } else if (taskRow.status === 'completed') {
           output = `Task ${taskKey} sudah selesai (completed) dan tidak dapat dijalankan ulang.`;
@@ -521,6 +627,8 @@ function createHandler(db = pool, generate = generateChat, create = createTask, 
     if (pathname !== PREFIX && !pathname.startsWith(PREFIX + '/')) return false;
     res.setHeader('Cache-Control', 'no-store');
     const route = pathname.slice(PREFIX.length);
+    const after = Math.max(0, Number(new URL(req.url, 'http://localhost').searchParams.get('after_sequence')) || 0);
+    const events = () => presentationEvents.filter(event => event.sequence > after);
     if (route === '/v1/chat/completions' && req.method === 'POST') {
       if (!isDirectLoopbackRequest(req)) {
         req.resume();
@@ -557,14 +665,14 @@ function createHandler(db = pool, generate = generateChat, create = createTask, 
         sendJson(res, 200, {
           profileName: 'dm-ai-os', readOnly: true,
           runtime: { name: 'DM AI OS', version: '1.0.0', vendor: 'Digital Musik Group', status: 'healthy', governance: 'read-only' },
-          agents: agents.map(agent => ({ id: agent.id, status: agent.metadata.presence_status, metadata: agent.metadata })),
+          agents: agents.map(agent => ({ id: agent.id, status: agent.metadata.presence_status, metadata: agent.metadata })), presentation_events: events(), presentation_sequence: presentationSequence,
         });
       } else {
         const agents = await readAgents(db);
         sendJson(res, 200, {
           defaultId: agents.find(agent => agent.metadata.agent_type === 'GROUP_CEO')?.id || agents[0]?.id || null,
           mainKey: 'main', scope: 'custom', readOnly: true,
-          capabilities: ['agents', 'sessions', 'chat', 'agent-roles'], models: {}, agents,
+          capabilities: ['agents', 'sessions', 'chat', 'agent-roles'], models: {}, agents, presentation_events: events(), presentation_sequence: presentationSequence,
         });
       }
     } catch (error) {
